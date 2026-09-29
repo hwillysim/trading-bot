@@ -1,0 +1,20 @@
+{
+  "name": "jev-trading-bot",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --experimental-strip-types src/index.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "replay": "node --experimental-strip-types src/replay/cli.ts data/trading-bot.sqlite",
+    "web:install": "npm --prefix web install",
+    "web:build": "npm --prefix web run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
+}
