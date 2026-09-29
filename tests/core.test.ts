@@ -67,11 +67,11 @@ test('paper limit orders rest, partially fill against visible ask quantity and r
     assert.equal(paper.portfolio(new Map()).portfolioUsdt,10);
     assert.equal(paper.portfolio(new Map()).reservedUsdt,0.2);
     assert.deepEqual(paper.processTick({...features,ts:now+1_000,ask:100.1}),[]);
-    assert.equal(paper.state.position,null);
+    assert.equal(paper.state.positions.length,0);
     const first=paper.processTick({...features,ts:now+2_000,ask:order.limitPrice,askQty:order.quantity/2});
     assert.equal(first.length,1);
     assert.equal(paper.openOrders[0].status,'PARTIALLY_FILLED');
-    const partialPosition=paper.state.position as {quantity:number}|null;
+    const partialPosition=paper.position(features.symbol);
     assert.ok(partialPosition && partialPosition.quantity>0);
     paper.processTick({...features,ts:now+33_000,ask:order.limitPrice});
     assert.equal(paper.openOrders.length,0);
@@ -106,6 +106,57 @@ test('maximum order update saves only the requested cap and survives restart',()
   } finally {rmSync(directory,{recursive:true,force:true});}
 });
 
+test('paper broker keeps separate positions and reserves no more than the configured slots',()=>{
+  const store=new Store(':memory:');
+  try {
+    const paper=new PaperBroker(store,{...DEFAULT_CAPS,floatUsdt:100,maxOrderUsdt:5,maxPositions:2});
+    const btc=paper.submitBuy(features,2,'test');
+    const eth=paper.submitBuy({...features,symbol:'ETHUSDT'},2,'test');
+    assert.ok(btc&&eth);
+    assert.equal(paper.occupiedSlots,2);
+    assert.equal(paper.submitBuy({...features,symbol:'SOLUSDT'},2,'test'),null);
+    paper.processTick({...features,ts:now+1_000,bookTs:now+1_000,ask:btc.limitPrice});
+    paper.processTick({...features,symbol:'ETHUSDT',ts:now+1_000,bookTs:now+1_000,ask:eth.limitPrice});
+    assert.deepEqual(paper.portfolio(new Map()).holdings.map(holding=>holding.symbol),['BTCUSDT','ETHUSDT']);
+    assert.equal(paper.portfolio(new Map()).openPositions,2);
+    assert.ok(paper.sell({...features,ts:now+2_000,bookTs:now+2_000},'test'));
+    assert.deepEqual(paper.state.positions.map(position=>position.symbol),['ETHUSDT']);
+    assert.ok(paper.submitBuy({...features,symbol:'SOLUSDT',ts:now+3_000},2,'test'));
+  } finally {store.close();}
+});
+
+test('maximum open positions accepts only one to five and persists across restart',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'trading-bot-positions-'));
+  const path=join(directory,'bot.sqlite');
+  try {
+    const first=new Store(path);
+    const engine=new BotEngine(first,null,null);
+    assert.throws(()=>engine.control('set-caps',{maxPositions:0}));
+    assert.throws(()=>engine.control('set-caps',{maxPositions:1.5}));
+    assert.throws(()=>engine.control('set-caps',{maxPositions:6}));
+    engine.control('set-caps',{maxPositions:2});
+    assert.equal(engine.caps.maxPositions,2);
+    first.close();
+    const second=new Store(path);
+    try {assert.equal(new BotEngine(second,null,null).caps.maxPositions,2);}
+    finally {second.close();}
+  } finally {rmSync(directory,{recursive:true,force:true});}
+});
+
+test('legacy paper position migrates without losing the holding',()=>{
+  const store=new Store(':memory:');
+  try {
+    const position={symbol:'BTCUSDT',quantity:0.002,entryPrice:100,entryTs:now,costUsdt:0.2,peakBid:100};
+    store.set('paper',{usdt:9.8,position,realisedPnlUsdt:0,feesUsdt:0,day:'2026-09-29',dailyRealisedLossUsdt:0,peakPortfolioUsdt:10});
+    const paper=new PaperBroker(store,{...DEFAULT_CAPS});
+    assert.deepEqual(paper.state.positions,[position]);
+    assert.equal(paper.portfolio(new Map()).openPositions,1);
+    const saved=store.get<Record<string,unknown>>('paper',{});
+    assert.equal('position' in saved,false);
+    assert.deepEqual(saved.positions,[position]);
+  } finally {store.close();}
+});
+
 test('stale books cannot fill and an exit cancels the remaining entry quantity',()=>{
   const store=new Store(':memory:');
   try {
@@ -117,7 +168,7 @@ test('stale books cannot fill and an exit cancels the remaining entry quantity',
     assert.equal(paper.openOrders.length,1);
     assert.ok(paper.sell({...features,ts:now+6_000,bid:order.limitPrice},'emergency'));
     assert.equal(paper.openOrders.length,0);
-    assert.equal(paper.state.position,null);
+    assert.equal(paper.state.positions.length,0);
     assert.ok(paper.state.usdt>9.99);
   } finally {store.close();}
 });
@@ -137,7 +188,7 @@ test('emergency stop prevents resumption and sells on a fresh tick',()=>{
     engine.onTick(features);
     engine.control('stop');
     assert.equal(engine.stopped,true);
-    assert.equal(engine.paper.state.position,null);
+    assert.equal(engine.paper.state.positions.length,0);
     assert.throws(()=>engine.control('resume'));
   } finally {store.close();}
 });
@@ -232,7 +283,7 @@ test('liquidate sells a paper holding at a fresh bid and pauses entries',()=>{
     engine.paper.buy(features,0.2,'test');
     engine.onTick(features);
     engine.control('liquidate');
-    assert.equal(engine.paper.state.position,null);
+    assert.equal(engine.paper.state.positions.length,0);
     assert.equal(engine.paused,true);
     assert.equal(engine.liquidationPending,false);
     assert.equal(store.trades(1)[0]?.reason,'manual_liquidation');
@@ -247,11 +298,55 @@ test('liquidate waits for a fresh bid and blocks resume until sold',()=>{
     engine.onTick({...features,bookTs:now-10_000});
     engine.control('liquidate');
     assert.equal(engine.liquidationPending,true);
-    assert.ok(engine.paper.state.position);
+    assert.equal(engine.paper.state.positions.length,1);
     assert.throws(()=>engine.control('resume'));
     engine.onTick({...features,ts:Date.now(),bookTs:Date.now()});
-    assert.equal(engine.paper.state.position,null);
+    assert.equal(engine.paper.state.positions.length,0);
     assert.equal(engine.liquidationPending,false);
+    assert.equal(engine.paused,true);
+  } finally {store.close();}
+});
+
+test('liquidate closes every holding as fresh quotes arrive',()=>{
+  const store=new Store(':memory:');
+  try {
+    const engine=new BotEngine(store,null,null);
+    engine.control('set-caps',{maxPositions:2});
+    assert.ok(engine.paper.buy(features,0.2,'test'));
+    assert.ok(engine.paper.buy({...features,symbol:'ETHUSDT'},0.2,'test'));
+    engine.onTick(features);
+    engine.onTick({...features,symbol:'ETHUSDT',bookTs:now-10_000});
+    engine.control('liquidate');
+    assert.deepEqual(engine.paper.state.positions.map(position=>position.symbol),['ETHUSDT']);
+    assert.equal(engine.liquidationPending,true);
+    assert.throws(()=>engine.control('resume'));
+    engine.onTick({...features,symbol:'ETHUSDT',ts:Date.now(),bookTs:Date.now()});
+    assert.equal(engine.paper.state.positions.length,0);
+    assert.equal(engine.liquidationPending,false);
+    assert.equal(engine.paused,true);
+    assert.equal(store.trades(4).filter(trade=>trade.side==='SELL').length,2);
+  } finally {store.close();}
+});
+
+test('emergency stop closes each holding before restart is allowed',()=>{
+  const store=new Store(':memory:');
+  try {
+    const engine=new BotEngine(store,null,null);
+    engine.control('set-caps',{maxPositions:2});
+    assert.ok(engine.paper.buy(features,0.2,'test'));
+    assert.ok(engine.paper.buy({...features,symbol:'ETHUSDT'},0.2,'test'));
+    engine.onTick({...features,bookTs:now-10_000});
+    engine.onTick({...features,symbol:'ETHUSDT',bookTs:now-10_000});
+    engine.control('stop');
+    assert.equal(engine.paper.state.positions.length,2);
+    assert.throws(()=>engine.control('restart'),/remaining paper holdings/);
+    engine.onTick({...features,ts:Date.now(),bookTs:Date.now()});
+    assert.equal(engine.paper.state.positions.length,1);
+    assert.throws(()=>engine.control('restart'),/remaining paper holdings/);
+    engine.onTick({...features,symbol:'ETHUSDT',ts:Date.now(),bookTs:Date.now()});
+    assert.equal(engine.paper.state.positions.length,0);
+    engine.control('restart');
+    assert.equal(engine.stopped,false);
     assert.equal(engine.paused,true);
   } finally {store.close();}
 });

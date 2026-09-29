@@ -49,7 +49,7 @@ export class BotEngine {
     this.stopped=store.get('stopped',false);
     this.liquidationPending=store.get('liquidationPending',false);
     this.paper=new PaperBroker(store,this.caps);
-    if(!this.paper.state.position&&this.liquidationPending) {this.liquidationPending=false;store.set('liquidationPending',false);}
+    if(!this.paper.state.positions.length&&this.liquidationPending) {this.liquidationPending=false;store.set('liquidationPending',false);}
     this.health.jevReady=!!jev;
     this.health.reviewerReady=!!reviewer;
     this.latestReview=store.get('latestReview',this.latestReview);
@@ -76,12 +76,12 @@ export class BotEngine {
     }
     this.paper.mark(tick);
     this.processOutcomes(tick);
-    const p=this.paper.state.position;
+    const p=this.paper.position(tick.symbol);
     const freshBook=!!tick.bookTs&&Date.now()-tick.bookTs<=3_000;
     if(p?.symbol===tick.symbol && (this.stopped||this.liquidationPending) && freshBook) {
       const reason=this.liquidationPending?'manual_liquidation':'emergency_stop';
       const trade=this.paper.sell(tick,reason,this.slippageBps(tick.symbol));
-      if(trade) {this.liquidationPending=false;this.store.set('liquidationPending',false);this.store.event('paper_exit',{symbol:tick.symbol,reason,notionalUsdt:trade.notionalUsdt});}
+      if(trade) {if(this.liquidationPending){this.liquidationPending=this.paper.state.positions.length>0;this.store.set('liquidationPending',this.liquidationPending);}this.store.event('paper_exit',{symbol:tick.symbol,reason,notionalUsdt:trade.notionalUsdt});}
     } else if(p?.symbol===tick.symbol && freshBook) {
       const age=(tick.ts-p.entryTs)/1000;
       const stop=tick.bid <= p.entryPrice*0.992;
@@ -91,7 +91,7 @@ export class BotEngine {
       const max=age>=this.caps.maxHoldSeconds;
       if(stop||trail||reversal||target||max) {
         const trade=this.paper.sell(tick,stop?'protective_stop':trail?'trailing_reversal':reversal?'jev_reversal':target?'target_hold_exit':'max_hold_exit',this.slippageBps(tick.symbol));
-        if(trade) {this.liquidationPending=false;this.store.set('liquidationPending',false);this.store.event('paper_exit',{symbol:tick.symbol,reason:trade.reason,notionalUsdt:trade.notionalUsdt});}
+        if(trade) this.store.event('paper_exit',{symbol:tick.symbol,reason:trade.reason,notionalUsdt:trade.notionalUsdt});
       }
     }
   }
@@ -133,7 +133,8 @@ export class BotEngine {
       if(freshQuote) this.store.addPendingOutcome({id:randomUUID(),decisionTs,dueTs:decisionTs+horizonSeconds*1_000,symbol:f.symbol,bucket,entryAsk:decisionQuote.ask,horizonSeconds});
       const values=this.store.labelValues(bucket,f.symbol);
       const edge=edgeStats(values);
-      const common={features:f,assessment:a,rules:this.rules.get(f.symbol),strategy:this.strategy,caps:this.caps,availableUsdt:this.paper.state.usdt,openPositions:this.paper.state.position||this.paper.openOrders.length?1:0,dailyRealisedLossUsdt:this.paper.state.dailyRealisedLossUsdt,apiSpendUsd:this.apiSpendToday(),edge,now:decisionTs,live:false,paused:this.paused||this.stopped};
+      const symbolOccupied=!!this.paper.position(f.symbol)||this.paper.openOrders.some(order=>order.side==='BUY'&&order.symbol===f.symbol);
+      const common={features:f,assessment:a,rules:this.rules.get(f.symbol),strategy:this.strategy,caps:this.caps,availableUsdt:this.paper.state.usdt,openPositions:symbolOccupied?this.caps.maxPositions:this.paper.occupiedSlots,dailyRealisedLossUsdt:this.paper.state.dailyRealisedLossUsdt,apiSpendUsd:this.apiSpendToday(),edge,now:decisionTs,live:false,paused:this.paused||this.stopped};
       const standardVerdict=judgeEntry(common);
       const verdict=judgeEntry({...common,exploratory:true});
       this.decisions++;
@@ -213,26 +214,30 @@ export class BotEngine {
   apiSpendToday() { const since=new Date(`${utcDay(Date.now())}T00:00:00.000Z`).getTime(); return Object.values(this.store.usageSince(since)).reduce((sum,u)=>sum+u.costUsd,0); }
   recordPortfolio(now=Date.now()) { this.store.portfolioPoint(now,this.paper.portfolio(this.latest).portfolioUsdt,this.portfolioRunId); }
   control(action:string,caps?:Partial<RiskCaps>,startingUsdt?:number) {
-    if(action==='restart'&&this.stopped) {this.stopped=false;this.paused=true;this.store.set('stopped',false);this.store.set('paused',true);}
+    if(action==='restart'&&this.stopped) {
+      if(this.paper.state.positions.length) throw new Error('Wait for remaining paper holdings to close before restarting');
+      this.stopped=false;this.paused=true;this.store.set('stopped',false);this.store.set('paused',true);
+    }
     else if(action==='pause') {for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);this.paused=true;this.store.set('paused',true);}
     else if(action==='resume'&&!this.stopped&&!this.liquidationPending) {this.paused=false;this.store.set('paused',false);}
     else if(action==='liquidate') {
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
       this.paused=true;this.store.set('paused',true);
-      const symbol=this.paper.state.position?.symbol;
-      this.liquidationPending=!!symbol;this.store.set('liquidationPending',this.liquidationPending);
-      if(symbol) {
-        const tick=this.latest.get(symbol);
+      for(const position of [...this.paper.state.positions]) {
+        const tick=this.latest.get(position.symbol);
         if(tick?.bookTs&&Date.now()-tick.bookTs<=3_000&&tick.bid>0) {
-          const trade=this.paper.sell(tick,'manual_liquidation',this.slippageBps(symbol));
-          if(trade) {this.liquidationPending=false;this.store.set('liquidationPending',false);this.store.event('paper_exit',{symbol,reason:trade.reason,notionalUsdt:trade.notionalUsdt});}
+          const trade=this.paper.sell(tick,'manual_liquidation',this.slippageBps(position.symbol));
+          if(trade) this.store.event('paper_exit',{symbol:position.symbol,reason:trade.reason,notionalUsdt:trade.notionalUsdt});
         }
       }
+      this.liquidationPending=this.paper.state.positions.length>0;this.store.set('liquidationPending',this.liquidationPending);
     }
     else if(action==='stop') {
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
-      const symbol=this.paper.state.position?.symbol;
-      if(symbol) {const tick=this.latest.get(symbol);if(tick?.bookTs&&Date.now()-tick.bookTs<=3_000) this.paper.sell(tick,'emergency_stop',this.slippageBps(symbol));}
+      for(const position of [...this.paper.state.positions]) {
+        const tick=this.latest.get(position.symbol);
+        if(tick?.bookTs&&Date.now()-tick.bookTs<=3_000) this.paper.sell(tick,'emergency_stop',this.slippageBps(position.symbol));
+      }
       this.stopped=true;this.paused=true;this.store.set('stopped',true);this.store.set('paused',true);
     }
     else if(action==='start-paper') {
@@ -246,9 +251,10 @@ export class BotEngine {
       this.paused=false;this.store.set('paused',false);
     }
     else if(action==='set-caps'&&caps) {
-      const allowed=['floatUsdt','maxOrderUsdt','dailyLossStopUsdt','dailyApiSpendUsd'];
+      const allowed=['floatUsdt','maxOrderUsdt','dailyLossStopUsdt','dailyApiSpendUsd','maxPositions'];
       if(Object.keys(caps).some(k=>!allowed.includes(k))) throw new Error('Unsupported cap');
       for(const value of Object.values(caps)) if(typeof value!=='number'||!Number.isFinite(value)||value<=0) throw new Error('Caps must be positive finite numbers');
+      if(caps.maxPositions!==undefined&&(!Number.isInteger(caps.maxPositions)||caps.maxPositions>5)) throw new Error('Maximum open positions must be an integer from 1 to 5');
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
       this.caps={...this.caps,...caps};this.paper.setCaps(this.caps);this.store.set('caps',this.caps);
     } else throw new Error('Unknown or unavailable action');

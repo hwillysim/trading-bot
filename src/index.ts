@@ -9,17 +9,22 @@ const store=new Store(process.env.BOT_DB_PATH??'data/trading-bot.sqlite');
 const engine=new BotEngine(store,process.env.JEV_API_KEY?new JevClient():null,process.env.OPENAI_API_KEY?new OpenAIReviewer():null);
 const features=new RollingMarketFeatures();
 const lastFeatureAt=new Map<string,number>();
-let pinnedSymbol='';
+let pinnedSymbols='';
 const feed=new BinanceMarketFeed(tick=>{
   engine.onTick(tick);
-  const held=engine.paper.state.position?.symbol??'';
-  if(held!==pinnedSymbol) {pinnedSymbol=held;feed.setPinnedSymbols(held?[held]:[]);}
+  refreshPinnedSymbols();
   features.add(tick);
   if(tick.ts-(lastFeatureAt.get(tick.symbol)??0)<1_000) return;
   lastFeatureAt.set(tick.symbol,tick.ts);
   const f=features.calculate(tick.symbol,tick.ts);
   if(f) engine.onFeatures(f);
 },rules=>engine.setRules(rules));
+function refreshPinnedSymbols() {
+  const symbols=[...new Set([...engine.paper.state.positions.map(position=>position.symbol),...engine.paper.openOrders.map(order=>order.symbol)])].sort();
+  const key=symbols.join(',');
+  if(key!==pinnedSymbols) {pinnedSymbols=key;feed.setPinnedSymbols(symbols);}
+}
+refreshPinnedSymbols();
 const server=startServer(engine);
 engine.recordPortfolio();
 
@@ -37,6 +42,7 @@ const maintenance=setInterval(()=>{
   if(Date.now()-engine.health.lastTickTs>10_000) engine.setFeedConnected(false);
   engine.setMonitoredMarketCount(feed.monitoredCount);
   engine.scan();
+  refreshPinnedSymbols();
   void engine.reviewIfDue();
   engine.checkRollback();
 },5_000);
