@@ -89,6 +89,23 @@ test('paper broker honours the configured maximum above the former hidden 0.20 U
   } finally {store.close();}
 });
 
+test('maximum order update saves only the requested cap and survives restart',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'trading-bot-cap-'));
+  const path=join(directory,'bot.sqlite');
+  try {
+    const first=new Store(path);
+    const engine=new BotEngine(first,null,null);
+    const original={...engine.caps};
+    engine.control('set-caps',{maxOrderUsdt:1.35});
+    assert.equal(engine.caps.maxOrderUsdt,1.35);
+    assert.deepEqual({...engine.caps,maxOrderUsdt:original.maxOrderUsdt},original);
+    first.close();
+    const second=new Store(path);
+    try {assert.equal(new BotEngine(second,null,null).caps.maxOrderUsdt,1.35);}
+    finally {second.close();}
+  } finally {rmSync(directory,{recursive:true,force:true});}
+});
+
 test('stale books cannot fill and an exit cancels the remaining entry quantity',()=>{
   const store=new Store(':memory:');
   try {
