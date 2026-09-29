@@ -41,6 +41,12 @@ test('momentum baseline selects positive short returns, and missing future quote
   assert.equal(result.summary.some(x=>x.horizons[120].meanNetBps!==null),false);
 });
 
+test('exploratory paper approvals get a separate replay series',()=>{
+  const result=evaluateReplay([snapshot(1,10_000,100),snapshot(2,40_000,101)], [decision(1,10_000,'exploratory_approved')], {feeBps:0,slippageBps:0});
+  assert.equal(result.summary.find(x=>x.signal==='signal:jev_exploratory')?.selectedDecisions,1);
+  assert.equal(result.summary.find(x=>x.signal==='signal:jev_policy')?.selectedDecisions,0);
+});
+
 test('stale recorded books do not provide entry or outcome quotes',()=>{
   const rows=[
     {id:1,ts:10_000,symbol:'BTCUSDT',data:{ts:10_000,bookTs:6_000,bid:100,ask:100.1}},

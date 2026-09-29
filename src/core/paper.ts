@@ -4,7 +4,6 @@ import { PAPER_SLIPPAGE_BPS, TAKER_FEE_BPS, utcDay } from './defaults.ts';
 import type { RecordedTrade, Store } from './store.ts';
 
 export interface Position { symbol:string; quantity:number; entryPrice:number; entryTs:number; costUsdt:number; peakBid:number }
-const PAPER_ORDER_CAP_USDT=0.2;
 export interface PaperOrder { id:string; symbol:string; side:'BUY'|'SELL'; status:'OPEN'|'PARTIALLY_FILLED'|'FILLED'|'CANCELLED'; limitPrice:number; quantity:number; filledQuantity:number; remainingQuantity:number; createdTs:number; expiresTs:number; reservedUsdt:number; feeUsdt:number; reason:string }
 export interface PaperState { usdt:number; position:Position|null; orders?:PaperOrder[]; realisedPnlUsdt:number; feesUsdt:number; day:string; dailyRealisedLossUsdt:number; peakPortfolioUsdt:number }
 
@@ -18,12 +17,18 @@ export class PaperBroker {
   }
   rollDay(ts:number) { const day=utcDay(ts); if(day!==this.state.day) { this.state.day=day; this.state.dailyRealisedLossUsdt=0; this.save(); } }
   setCaps(caps:RiskCaps) {this.caps=caps;}
+  startWithBalance(usdt:number) {
+    if(!Number.isFinite(usdt)||usdt<=0||usdt>1_000_000) throw new Error('Starting USDT must be between 0 and 1,000,000');
+    if(this.state.position||this.openOrders.length) throw new Error('Liquidate holdings and cancel orders before starting a new paper run');
+    this.state={usdt,position:null,orders:[],realisedPnlUsdt:0,feesUsdt:0,day:utcDay(Date.now()),dailyRealisedLossUsdt:0,peakPortfolioUsdt:usdt};
+    this.save();
+  }
   private save() { this.store.set('paper',this.state); }
   get openOrders():PaperOrder[] { return (this.state.orders??[]).filter(o=>o.status==='OPEN'||o.status==='PARTIALLY_FILLED').map(o=>({...o})); }
   submitBuy(tick:MarketTick,notionalUsdt:number,reason:string,extraSlippageBps=0):PaperOrder|null {
     this.rollDay(tick.ts);
     const orders=this.state.orders??=[];
-    if(this.state.position || orders.some(o=>o.side==='BUY'&&(o.status==='OPEN'||o.status==='PARTIALLY_FILLED')) || !Number.isFinite(tick.bid)||tick.bid<=0||!Number.isFinite(tick.askQty)||tick.askQty<=0||notionalUsdt<=0||notionalUsdt>Math.min(PAPER_ORDER_CAP_USDT,this.caps.maxOrderUsdt)||notionalUsdt>this.state.usdt||this.state.dailyRealisedLossUsdt>=this.caps.dailyLossStopUsdt) return null;
+    if(this.state.position || orders.some(o=>o.side==='BUY'&&(o.status==='OPEN'||o.status==='PARTIALLY_FILLED')) || !Number.isFinite(tick.bid)||tick.bid<=0||!Number.isFinite(tick.askQty)||tick.askQty<=0||notionalUsdt<=0||notionalUsdt>this.caps.maxOrderUsdt||notionalUsdt>this.state.usdt||this.state.dailyRealisedLossUsdt>=this.caps.dailyLossStopUsdt) return null;
     const limitPrice=tick.bid*(1+Math.max(0,Math.min(10,PAPER_SLIPPAGE_BPS+extraSlippageBps))/10_000);
     const reserve=Math.min(notionalUsdt,this.state.usdt);
     const quantity=reserve/(limitPrice*(1+TAKER_FEE_BPS/10_000));
@@ -59,7 +64,7 @@ export class PaperBroker {
   cancelOrder(orderId:string):boolean { const order=(this.state.orders??[]).find(o=>o.id===orderId&&(o.status==='OPEN'||o.status==='PARTIALLY_FILLED'));if(!order)return false;this.state.usdt+=order.reservedUsdt;order.reservedUsdt=0;order.status='CANCELLED';this.save();return true; }
   buy(tick:MarketTick,notionalUsdt:number,reason:string,extraSlippageBps=0):RecordedTrade|null {
     this.rollDay(tick.ts);
-    if(this.state.position || this.openOrders.some(o=>o.side==='BUY') || !Number.isFinite(tick.ask) || tick.ask<=0 || notionalUsdt<=0 || notionalUsdt>Math.min(PAPER_ORDER_CAP_USDT,this.caps.maxOrderUsdt) || notionalUsdt>this.state.usdt || this.state.dailyRealisedLossUsdt>=this.caps.dailyLossStopUsdt) return null;
+    if(this.state.position || this.openOrders.some(o=>o.side==='BUY') || !Number.isFinite(tick.ask) || tick.ask<=0 || notionalUsdt<=0 || notionalUsdt>this.caps.maxOrderUsdt || notionalUsdt>this.state.usdt || this.state.dailyRealisedLossUsdt>=this.caps.dailyLossStopUsdt) return null;
     const price=tick.ask*(1+(PAPER_SLIPPAGE_BPS+extraSlippageBps)/10_000);
     const feeUsdt=notionalUsdt*TAKER_FEE_BPS/10_000;
     const quantity=(notionalUsdt-feeUsdt)/price;

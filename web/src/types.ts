@@ -8,8 +8,8 @@ export type DashboardState = {
   latestReview:string;
   openOrders:Array<{id:string;symbol:string;side:string;price:number;quantity:number;status:string;ts:number}>;
   recentTrades:Array<{id:string;ts:number;symbol:string;side:'BUY'|'SELL';quantity:number;price:number;notionalUsdt:number;feeUsdt:number;reason:string;mode:'paper'|'live'}>;
-  recentEvents:unknown[]; skippedReasons:Record<string,number>;
-  metrics:{decisions:number;approved:number;avgDecisionLatencyMs:number}; candidateCount:number; updatedAt:number;
+  recentEvents:unknown[]; skippedReasons:Record<string,number>; jevGateFailures?:Record<string,number>;
+  metrics:{decisions:number;approved:number;avgDecisionLatencyMs:number}; candidateCount:number; monitoredMarketCount?:number; portfolioRunId?:number; updatedAt:number;
 };
 type Usage={inputTokens:number;outputTokens:number;costUsd:number;requests:number};
-export type ControlAction='pause'|'resume'|'liquidate'|'stop'|'set-caps';
+export type ControlAction='pause'|'resume'|'liquidate'|'stop'|'restart'|'set-caps'|'start-paper';

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { JevAssessment, MarketFeatures, SymbolRules } from '../src/shared/types.ts';
 import { DEFAULT_CAPS, DEFAULT_STRATEGY } from '../src/core/defaults.ts';
@@ -10,7 +13,7 @@ import { Store } from '../src/core/store.ts';
 const now=Date.now();
 const features:MarketFeatures={symbol:'BTCUSDT',ts:now,last:100,bid:99.99,ask:100,bidQty:100,askQty:100,bookTs:now,quoteVolume24h:2_000_000,priceChangePercent24h:1,return15s:0.01,return1m:0.02,return5m:0.03,volatility1m:0.001,relativeVolume1m:2,buyFlow1m:1000,sellFlow1m:500,spreadBps:1,bookImbalance:0,depthUsdt:20_000,estimatedSlippageBps:0.5};
 const rules:SymbolRules={symbol:'BTCUSDT',status:'TRADING',baseAsset:'BTC',quoteAsset:'USDT',minNotional:5,minQty:0.00001,stepSize:0.00001,tickSize:0.01};
-const assessment:JevAssessment={symbol:'BTCUSDT',ts:now,model:'jev-1.13.0',continuationProbability:0.9,reversalProbability:0.1,waitProbability:0.1,setupScore:3.5,setupConfidence:0.92,latencyMs:100,inputTokens:500,outputTokens:50,costUsd:0.000021,raw:{}};
+const assessment:JevAssessment={symbol:'BTCUSDT',ts:now,horizonSeconds:120,model:'jev-1.13.0',continuationProbability:0.9,reversalProbability:0.1,waitProbability:0.1,setupScore:3.5,setupConfidence:0.92,latencyMs:100,inputTokens:500,outputTokens:50,costUsd:0.000021,raw:{}};
 
 test('live entry obeys exchange minimum while paper accepts small orders',()=>{
   const input={features,assessment,rules,strategy:{...DEFAULT_STRATEGY},caps:{...DEFAULT_CAPS},availableUsdt:10,openPositions:0,dailyRealisedLossUsdt:0,apiSpendUsd:0,edge:{count:50,meanNetBps:50,lowerNetBps:30},now,paused:false};
@@ -23,6 +26,15 @@ test('entry refuses stale data, unproven edge and loss stop',()=>{
   assert.equal(judgeEntry(input).reason,'unproven_net_edge');
   assert.equal(judgeEntry({...input,features:{...features,ts:now-4_000}}).reason,'stale_data');
   assert.equal(judgeEntry({...input,dailyRealisedLossUsdt:1}).reason,'daily_loss_stop');
+});
+
+test('exploratory entry uses its separate JEV gate while retaining safety checks',()=>{
+  const input={features,assessment:{...assessment,setupScore:2,setupConfidence:.5,continuationProbability:.5,waitProbability:.5},rules,strategy:{...DEFAULT_STRATEGY},caps:{...DEFAULT_CAPS,maxOrderUsdt:5,floatUsdt:100},availableUsdt:100,openPositions:0,dailyRealisedLossUsdt:0,apiSpendUsd:0,edge:{count:0,meanNetBps:0,lowerNetBps:-Infinity},now,paused:false,live:false};
+  const result=judgeEntry({...input,exploratory:true});
+  assert.equal(result.reason,'exploratory_approved');
+  assert.equal(result.orderUsdt,2);
+  assert.deepEqual(judgeEntry({...input,assessment:{...input.assessment,setupConfidence:.49},exploratory:true}).gateFailures,['setupConfidence']);
+  assert.equal(judgeEntry({...input,exploratory:true,dailyRealisedLossUsdt:1}).reason,'daily_loss_stop');
 });
 
 test('review patch cannot change hard limits or jump thresholds',()=>{
@@ -65,6 +77,15 @@ test('paper limit orders rest, partially fill against visible ask quantity and r
     assert.equal(paper.openOrders.length,0);
     assert.ok(paper.state.usdt>9.8);
     assert.ok(paper.state.feesUsdt>0);
+  } finally {store.close();}
+});
+
+test('paper broker honours the configured maximum above the former hidden 0.20 USDT cap',()=>{
+  const store=new Store(':memory:');
+  try {
+    const paper=new PaperBroker(store,{...DEFAULT_CAPS,floatUsdt:100,maxOrderUsdt:5});
+    assert.equal(paper.submitBuy(features,5,'exploratory_paper')?.reservedUsdt,5);
+    assert.equal(paper.submitBuy({...features,symbol:'ETHUSDT'},5.01,'exploratory_paper'),null);
   } finally {store.close();}
 });
 
@@ -112,6 +133,53 @@ test('portfolio history keeps the latest point in each chart interval',()=>{
     store.portfolioPoint(2_200,10.2);
     assert.deepEqual(store.portfolioHistory(0,1_000),[{ts:1_500,valueUsdt:10.1},{ts:2_200,valueUsdt:10.2}]);
     assert.deepEqual(store.portfolioHistory(2_000,1_000),[{ts:2_200,valueUsdt:10.2}]);
+  } finally {store.close();}
+});
+
+test('portfolio history keeps separate paper run balances',()=>{
+  const store=new Store(':memory:');
+  try {
+    store.portfolioPoint(1_000,10);
+    const runId=store.startPortfolioRun(2_000);
+    store.portfolioPoint(2_001,1_000,runId);
+    store.portfolioPoint(3_000,1_001,runId);
+    assert.equal(store.currentPortfolioRunId(),runId);
+    assert.deepEqual(store.portfolioHistory(0,1,500,runId),[{ts:2_001,valueUsdt:1_000},{ts:3_000,valueUsdt:1_001}]);
+    assert.equal(store.oldestPortfolioTs(runId),2_001);
+  } finally {store.close();}
+});
+
+test('pending hypothetical outcomes survive restart and never create paper fills',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'pending-outcome-')),path=join(dir,'bot.sqlite');
+  let store=new Store(path);
+  try {
+    store.addPendingOutcome({id:'outcome-1',decisionTs:now,dueTs:now+120_000,symbol:'BTCUSDT',bucket:'up:low:tight:120',entryAsk:100,horizonSeconds:120});
+    store.close();
+    store=new Store(path);
+    const engine=new BotEngine(store,null,null);
+    engine.onTick({...features,ts:now+120_000,bid:101,ask:101,bookTs:now+120_000});
+    assert.equal(store.pendingOutcomes().length,0);
+    assert.equal(store.labelValues('up:low:tight:120','BTCUSDT').length,1);
+    assert.equal(store.trades().length,0);
+  } finally {store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a rejected exploratory JEV assessment still queues its hypothetical outcome',async()=>{
+  const store=new Store(':memory:');
+  try {
+    const lowAssessment={...assessment,setupScore:2,setupConfidence:.4,continuationProbability:.4,waitProbability:.3};
+    const engine=new BotEngine(store,{assess:async()=>lowAssessment},null);
+    engine.setRules([rules]);
+    engine.setFeedConnected(true);
+    engine.onTick(features);
+    engine.onFeatures(features);
+    engine.scan(now);
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(store.pendingOutcomes().length,1);
+    const decision=store.db.prepare('SELECT verdict,data FROM decisions ORDER BY id DESC LIMIT 1').get() as {verdict:string;data:string};
+    assert.equal(decision.verdict,'exploratory_jev_threshold');
+    assert.deepEqual(JSON.parse(decision.data).exploratoryGateFailures,['setupConfidence','continuationProbability']);
+    assert.equal(store.trades().length,0);
   } finally {store.close();}
 });
 

@@ -106,7 +106,7 @@ export class OpenAIReviewer {
         method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body: JSON.stringify({
           model, store: false,
-          instructions: "Review the strategy using the supplied recent performance metrics and symbol candidates. Return no_change if evidence is weak, sparse, noisy, or inconclusive. Otherwise propose the smallest bounded config patch. Never exceed the supplied RiskCaps. Select symbols only from candidates. Give a one-sentence summary.",
+          instructions: "Review the strategy using the supplied recent performance metrics, hypothetical outcomes grouped by symbol and market regime, and symbol candidates. Treat exploratory paper results as experimental and never claim they establish profitability. Return no_change if evidence is weak, sparse, noisy, or inconclusive. Otherwise propose the smallest bounded strategy patch. Do not change the paper exploration gate or supplied risk caps. Select symbols only from candidates. Give a one-sentence summary.",
           input: JSON.stringify(input),
           text: { format: { type: "json_schema", name: "strategy_review", strict: true, schema } },
         }), signal: controller.signal,

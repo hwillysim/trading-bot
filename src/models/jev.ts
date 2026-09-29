@@ -34,18 +34,19 @@ export class JevClient {
   private readonly options: { apiKey?: string; endpoint?: string; timeoutMs?: number; fetchImpl?: Fetcher };
   constructor(options: { apiKey?: string; endpoint?: string; timeoutMs?: number; fetchImpl?: Fetcher } = {}) { this.options = options; }
 
-  async assess(features: MarketFeatures): Promise<JevAssessment> {
+  async assess(features: MarketFeatures, horizonSeconds=60): Promise<JevAssessment> {
     const apiKey = this.options.apiKey ?? process.env.JEV_API_KEY;
     if (!apiKey) throw new ModelError("JEV_API_KEY is required");
     validateFeatures(features);
+    if(!Number.isInteger(horizonSeconds)||horizonSeconds<1||horizonSeconds>900) throw new ModelError("Invalid assessment horizon");
     const timeoutMs = this.options.timeoutMs ?? 15_000;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) throw new ModelError("Invalid Jev timeout");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const started = Date.now();
     const questions = {
-      continuation: { type: "noul", instructions: "Will the current short-term price pattern continue over the next 60 seconds?" },
-      reversal: { type: "noul", instructions: "Is a short-term reversal more likely than continuation over the next 60 seconds?" },
+      continuation: { type: "noul", instructions: `Will the current short-term price pattern continue over the next ${horizonSeconds} seconds?` },
+      reversal: { type: "noul", instructions: `Is a short-term reversal more likely than continuation over the next ${horizonSeconds} seconds?` },
       wait: { type: "noul", instructions: "Is waiting preferable because the short-term signal is weak or conflicting?" },
       setup: { type: "score", instructions: "Rate the quality of this short-term trading setup.", criteria: ["poor or conflicting", "weak", "moderate", "strong", "very strong"] },
     };
@@ -79,7 +80,7 @@ export class JevClient {
       const tokenUsage = usage(body.usage.input_tokens, body.usage.output_tokens);
       const durationMs = Date.now() - started;
       return {
-        symbol: features.symbol, ts: features.ts, model: typeof body.model === "string" ? body.model : MODEL,
+        symbol: features.symbol, ts: features.ts, horizonSeconds, model: typeof body.model === "string" ? body.model : MODEL,
         continuationProbability, reversalProbability,
         waitProbability, setupScore, setupConfidence, latencyMs: durationMs,
         inputTokens: tokenUsage.inputTokens, outputTokens: tokenUsage.outputTokens,

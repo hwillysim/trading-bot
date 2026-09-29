@@ -27,6 +27,7 @@ test('review evidence returns bounded aggregates without raw snapshots', () => {
     assert.ok(Math.abs(evidence.decisions.jev.meanConfidence-0.85)<1e-12);
     assert.equal(evidence.decisions.jev.meanScore,4.5);
     assert.deepEqual(evidence.decisions.jev.outcomes.byBucket['up:high:wide:60'],{count:2,meanNetBps:3});
+    assert.deepEqual(evidence.decisions.jev.outcomes.bySymbolRegime['BTCUSDT|up:high:wide:60'],{count:2,meanNetBps:3});
     assert.equal(evidence.api.jev.costUsd,0.02);
     assert.equal(evidence.riskEvents.control,1);
     assert.equal(JSON.stringify(evidence).includes('must not appear'),false);

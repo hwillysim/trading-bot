@@ -24,7 +24,7 @@ test("Jev sends one symbol state with pinned model and several typed questions",
     sent = JSON.parse(String(init?.body));
     return Response.json({ model: "jev-1.13.0", answers: jevAnswers, usage: { input_tokens: 100, output_tokens: 4 } });
   } });
-  const result = await client.assess(features);
+  const result = await client.assess(features,120);
   assert.equal(sent?.model, "jev-1.13.0");
   assert.equal((sent?.state as Record<string, unknown>).tradeBuyerIsMaker, undefined);
   assert.equal((sent?.state as Record<string, unknown>).tradeQty, undefined);
@@ -32,6 +32,8 @@ test("Jev sends one symbol state with pinned model and several typed questions",
   assert.equal((sent?.state as Record<string, unknown>).last, features.last);
   assert.equal(Object.keys(sent?.questions as object).length, 4);
   assert.equal(result.continuationProbability, 0.7);
+  assert.equal(result.horizonSeconds,120);
+  assert.match(String((sent?.questions as Record<string,{instructions:string}>).continuation?.instructions),/120 seconds/);
   assert.equal(result.inputTokens, 100);
   assert.ok(Math.abs(result.costUsd - 0.0000042) < 1e-12);
 });

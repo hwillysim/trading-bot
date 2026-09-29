@@ -39,6 +39,8 @@ export class BinanceMarketFeed {
     this.wsUrl = wsUrl;
   }
 
+  get monitoredCount():number { return this.subscribed.size; }
+
   async start(): Promise<void> {
     if (!this.stopped) return;
     this.stopped = false;

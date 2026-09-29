@@ -61,6 +61,7 @@ export interface RiskCaps {
 export interface JevAssessment {
   symbol: string;
   ts: number;
+  horizonSeconds: number;
   model: string;
   continuationProbability: number;
   reversalProbability: number;

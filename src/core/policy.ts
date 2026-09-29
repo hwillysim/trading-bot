@@ -2,7 +2,8 @@ import type { JevAssessment, MarketFeatures, RiskCaps, StrategyConfig, SymbolRul
 import { PAPER_SLIPPAGE_BPS, TAKER_FEE_BPS } from './defaults.ts';
 
 export interface EdgeStats { count: number; lowerNetBps: number; meanNetBps: number }
-export interface EntryVerdict { allowed: boolean; reason: string; requiredBps: number; orderUsdt: number }
+export interface EntryVerdict { allowed: boolean; reason: string; requiredBps: number; orderUsdt: number; gateFailures?:string[] }
+export const EXPLORATORY_JEV_GATE=Object.freeze({setupScore:2,setupConfidence:0.5,continuationProbability:0.5,waitProbability:0.5});
 
 export function regimeBucket(f: MarketFeatures): string {
   const momentum = f.return15s > 0 && f.return1m > 0 ? 'up' : f.return15s < 0 && f.return1m < 0 ? 'down' : 'mixed';
@@ -19,7 +20,7 @@ export function judgeEntry(input: {
   features: MarketFeatures; assessment: JevAssessment; rules?: SymbolRules;
   strategy: StrategyConfig; caps: RiskCaps; availableUsdt: number;
   openPositions: number; dailyRealisedLossUsdt: number; apiSpendUsd: number;
-  edge: EdgeStats; now: number; live: boolean; paused: boolean;
+  edge: EdgeStats; now: number; live: boolean; paused: boolean; exploratory?:boolean;
 }): EntryVerdict {
   const { features: f, assessment: a, rules, strategy: s, caps, edge, now } = input;
   const orderUsdt = Math.min(caps.maxOrderUsdt, caps.floatUsdt * s.positionFraction, input.availableUsdt);
@@ -37,7 +38,13 @@ export function judgeEntry(input: {
   if (f.quoteVolume24h < 1_000_000 || f.depthUsdt < 2_000 || f.spreadBps > 25) return deny('liquidity');
   if (orderUsdt <= 0 || orderUsdt > input.availableUsdt) return deny('insufficient_usdt');
   if (input.live && orderUsdt < rules.minNotional * 1.02) return deny('below_exchange_minimum');
-  if (a.setupScore < 3 || a.setupConfidence < s.entryConfidence || a.continuationProbability < s.continuationProbability || a.waitProbability > 0.3) return deny('jev_threshold');
+  const gateFailures:string[]=[];
+  if(a.setupScore<(input.exploratory?EXPLORATORY_JEV_GATE.setupScore:3)) gateFailures.push('setupScore');
+  if(a.setupConfidence<(input.exploratory?EXPLORATORY_JEV_GATE.setupConfidence:s.entryConfidence)) gateFailures.push('setupConfidence');
+  if(a.continuationProbability<(input.exploratory?EXPLORATORY_JEV_GATE.continuationProbability:s.continuationProbability)) gateFailures.push('continuationProbability');
+  if(a.waitProbability>(input.exploratory?EXPLORATORY_JEV_GATE.waitProbability:0.3)) gateFailures.push('waitProbability');
+  if(gateFailures.length) return {...deny(input.exploratory?'exploratory_jev_threshold':'jev_threshold'),gateFailures};
+  if(input.exploratory) return {allowed:true,reason:'exploratory_approved',requiredBps,orderUsdt};
   if (edge.count < 30 || edge.lowerNetBps <= s.costBufferBps) return deny('unproven_net_edge');
   return { allowed: true, reason: 'approved', requiredBps, orderUsdt };
 }

@@ -44,8 +44,10 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
     const regime = regimeOf(features);
     const momentum = finite(features.return15s) && finite(features.return1m) && features.return15s > 0 && features.return1m > 0;
     const jevSelected = decision.verdict === 'approved';
+    const exploratorySelected = decision.verdict === 'exploratory_approved';
     const groupsForDecision = [
       [`signal:jev_policy`, decision.symbol, regime],
+      [`signal:jev_exploratory`, decision.symbol, regime],
       [`signal:momentum_baseline`, decision.symbol, regime],
       [`signal:no_trade`, decision.symbol, regime],
     ];
@@ -64,7 +66,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
       const group = groups.get(key) ?? {decisions:0,actions:0,outcomes:Object.fromEntries(HORIZONS.map(h=>[h,{covered:0,netBps:[]}]))};
       group.decisions++;
       const selected = signal === 'signal:momentum_baseline' ? momentum
-        : signal === 'signal:no_trade' ? false : jevSelected;
+        : signal === 'signal:no_trade' ? false : signal === 'signal:jev_exploratory' ? exploratorySelected : jevSelected;
       if (selected) group.actions++;
       groups.set(key, group);
       for (const horizon of HORIZONS) {

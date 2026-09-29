@@ -35,6 +35,7 @@ void startFeed();
 
 const maintenance=setInterval(()=>{
   if(Date.now()-engine.health.lastTickTs>10_000) engine.setFeedConnected(false);
+  engine.setMonitoredMarketCount(feed.monitoredCount);
   engine.scan();
   void engine.reviewIfDue();
   engine.checkRollback();

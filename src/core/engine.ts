@@ -4,16 +4,14 @@ import { judgeEntry, regimeBucket, validateReviewPatch, type EdgeStats } from '.
 import { PaperBroker } from './paper.ts';
 import { Store } from './store.ts';
 
-export interface AssessmentClient { assess(features:MarketFeatures):Promise<JevAssessment> }
+export interface AssessmentClient { assess(features:MarketFeatures,horizonSeconds?:number):Promise<JevAssessment> }
 export interface ReviewClient { review(input:{strategy:StrategyConfig;caps:RiskCaps;metrics:unknown;candidates:string[]}):Promise<ReviewProposal> }
-interface PendingLabel { symbol:string; due:number; entryAsk:number; bucket:string; ts:number }
-
 const emptyUsage=()=>({inputTokens:0,outputTokens:0,costUsd:0,requests:0});
 
 export class BotEngine {
   readonly store:Store;
-  private readonly jev:AssessmentClient|null;
-  private readonly reviewer:ReviewClient|null;
+  private jev:AssessmentClient|null;
+  private reviewer:ReviewClient|null;
   caps:RiskCaps;
   strategy:StrategyConfig;
   paused:boolean;
@@ -25,7 +23,8 @@ export class BotEngine {
   readonly features=new Map<string,MarketFeatures>();
   readonly assessments=new Map<string,JevAssessment>();
   readonly skippedReasons:Record<string,number>={};
-  readonly pendingLabels:PendingLabel[]=[];
+  readonly jevGateFailures:Record<string,number>={};
+  monitoredMarketCount=0;
   readonly health={feedConnected:false,lastTickTs:0,jevReady:false,reviewerReady:false};
   latestReview='The strategy has not been reviewed yet.';
   decisions=0;
@@ -37,12 +36,14 @@ export class BotEngine {
   private lastReviewTs=0;
   private reviewing=false;
   private lastSnapshot=new Map<string,number>();
+  portfolioRunId:number;
   private previousStrategy:StrategyConfig|null=null;
   private patchTradeCount=0;
   private patchPnl=0;
   constructor(store:Store,jev:AssessmentClient|null,reviewer:ReviewClient|null) {
     this.store=store;this.jev=jev;this.reviewer=reviewer;
     this.caps=store.get('caps',{...DEFAULT_CAPS});
+    this.portfolioRunId=store.currentPortfolioRunId();
     this.strategy=store.get('strategy',{...DEFAULT_STRATEGY});
     this.paused=store.get('paused',false);
     this.stopped=store.get('stopped',false);
@@ -54,7 +55,12 @@ export class BotEngine {
     this.latestReview=store.get('latestReview',this.latestReview);
     this.lastReviewTs=store.get('lastReviewTs',0);
   }
+  setClients(jev:AssessmentClient|null,reviewer:ReviewClient|null) {
+    this.jev=jev;this.reviewer=reviewer;
+    this.health.jevReady=!!jev;this.health.reviewerReady=!!reviewer;
+  }
   setRules(rules:SymbolRules[]) { this.rules.clear(); for(const r of rules) this.rules.set(r.symbol,r); this.store.event('rules_loaded',{count:this.rules.size}); }
+  setMonitoredMarketCount(count:number) { this.monitoredMarketCount=Math.max(0,Math.floor(count)); }
   setFeedConnected(value:boolean) { const changed=this.health.feedConnected!==value; this.health.feedConnected=value; if(changed&&!value) this.store.event('feed_disconnected',{}); }
   onTick(tick:MarketTick) {
     if(!Number.isFinite(tick.last)||tick.last<=0) return;
@@ -69,7 +75,7 @@ export class BotEngine {
       for(const fill of fills) this.store.event('paper_fill',{symbol:fill.symbol,quantity:fill.quantity,price:fill.price});
     }
     this.paper.mark(tick);
-    this.processLabels(tick);
+    this.processOutcomes(tick);
     const p=this.paper.state.position;
     const freshBook=!!tick.bookTs&&Date.now()-tick.bookTs<=3_000;
     if(p?.symbol===tick.symbol && (this.stopped||this.liquidationPending) && freshBook) {
@@ -116,41 +122,53 @@ export class BotEngine {
   }
   private async assess(f:MarketFeatures) {
     try {
-      const a=await this.jev!.assess(f);
+      const horizonSeconds=this.strategy.targetHoldSeconds;
+      const a=await this.jev!.assess(f,horizonSeconds);
       this.assessments.set(f.symbol,a);
       this.store.usage(Date.now(),'jev',a.inputTokens,a.outputTokens,a.costUsd);
-      const bucket=`${regimeBucket(f)}:${this.strategy.targetHoldSeconds}`;
-      if(a.setupScore>=3&&a.setupConfidence>=this.strategy.entryConfidence&&a.continuationProbability>=this.strategy.continuationProbability&&a.waitProbability<=0.3)
-        this.pendingLabels.push({symbol:f.symbol,due:f.ts+this.strategy.targetHoldSeconds*1_000,entryAsk:f.ask,bucket,ts:f.ts});
+      const decisionTs=Date.now();
+      const decisionQuote=this.latest.get(f.symbol);
+      const freshQuote=decisionQuote&&decisionQuote.bookTs&&decisionQuote.bookTs<=decisionQuote.ts&&decisionQuote.ts-decisionQuote.bookTs<=3_000&&decisionTs-decisionQuote.ts<=3_000&&decisionQuote.ask>0;
+      const bucket=`${regimeBucket(f)}:${horizonSeconds}`;
+      if(freshQuote) this.store.addPendingOutcome({id:randomUUID(),decisionTs,dueTs:decisionTs+horizonSeconds*1_000,symbol:f.symbol,bucket,entryAsk:decisionQuote.ask,horizonSeconds});
       const values=this.store.labelValues(bucket,f.symbol);
       const edge=edgeStats(values);
-      const verdict=judgeEntry({features:f,assessment:a,rules:this.rules.get(f.symbol),strategy:this.strategy,caps:this.caps,availableUsdt:this.paper.state.usdt,openPositions:this.paper.state.position||this.paper.openOrders.length?1:0,dailyRealisedLossUsdt:this.paper.state.dailyRealisedLossUsdt,apiSpendUsd:this.apiSpendToday(),edge,now:Date.now(),live:false,paused:this.paused||this.stopped});
+      const common={features:f,assessment:a,rules:this.rules.get(f.symbol),strategy:this.strategy,caps:this.caps,availableUsdt:this.paper.state.usdt,openPositions:this.paper.state.position||this.paper.openOrders.length?1:0,dailyRealisedLossUsdt:this.paper.state.dailyRealisedLossUsdt,apiSpendUsd:this.apiSpendToday(),edge,now:decisionTs,live:false,paused:this.paused||this.stopped};
+      const standardVerdict=judgeEntry(common);
+      const verdict=judgeEntry({...common,exploratory:true});
       this.decisions++;
       this.latencyTotal+=a.latencyMs;
+      for(const gate of verdict.gateFailures??[]) this.jevGateFailures[gate]=(this.jevGateFailures[gate]??0)+1;
       if(verdict.allowed) {
         const tick=this.latest.get(f.symbol);
         if(tick?.bookTs&&Date.now()-tick.bookTs<=3_000) {
-          const order=this.paper.submitBuy(tick,verdict.orderUsdt,'jev_net_edge',this.slippageBps(f.symbol));
-          if(order) {this.approved++;this.store.event('paper_order',{symbol:f.symbol,limitPrice:order.limitPrice,quantity:order.quantity});}
+          const order=this.paper.submitBuy(tick,verdict.orderUsdt,'exploratory_paper',this.slippageBps(f.symbol));
+          if(order) {this.approved++;this.store.event('exploratory_paper_order',{symbol:f.symbol,limitPrice:order.limitPrice,quantity:order.quantity,notionalUsdt:verdict.orderUsdt,standardVerdict:standardVerdict.reason});}
         }
       } else this.skippedReasons[verdict.reason]=(this.skippedReasons[verdict.reason]??0)+1;
-      this.store.decision(Date.now(),f.symbol,verdict.reason,{assessment:a,features:f,edge,requiredBps:verdict.requiredBps});
+      const finalVerdict=verdict.allowed?'exploratory_approved':verdict.reason;
+      this.store.decision(decisionTs,f.symbol,finalVerdict,{assessment:a,features:f,edge,requiredBps:verdict.requiredBps,standardVerdict:standardVerdict.reason,exploratoryGateFailures:verdict.gateFailures??[],outcomeQueued:!!freshQuote});
     } catch(error) {
       this.skippedReasons.jev_error=(this.skippedReasons.jev_error??0)+1;
       this.store.event('jev_error',{message:error instanceof Error?error.message:String(error)});
     }
   }
-  private processLabels(tick:MarketTick) {
-    if(!tick.bookTs||Date.now()-tick.bookTs>3_000) return;
-    for(let i=this.pendingLabels.length-1;i>=0;i--) {
-      const label=this.pendingLabels[i];
-      if(label.symbol!==tick.symbol||tick.ts<label.due) continue;
+  private processOutcomes(tick:MarketTick) {
+    for(const outcome of this.store.pendingOutcomes(tick.symbol)) {
+      if(tick.ts<outcome.dueTs) continue;
+      if(tick.ts-outcome.dueTs>5_000) {
+        this.store.completePendingOutcome(outcome.id);
+        this.store.event('outcome_discarded',{symbol:tick.symbol,horizonSeconds:outcome.horizonSeconds,reason:'no_quote_near_due_time'},tick.ts);
+        continue;
+      }
+      if(!tick.bookTs||tick.bookTs>tick.ts||tick.ts-tick.bookTs>3_000||!Number.isFinite(tick.bid)||tick.bid<=0) continue;
       const slip=PAPER_SLIPPAGE_BPS+this.slippageBps(tick.symbol);
-      const buy=label.entryAsk*(1+slip/10_000);
+      const buy=outcome.entryAsk*(1+slip/10_000);
       const sell=tick.bid*(1-slip/10_000);
       const netBps=(sell/buy-1)*10_000-2*TAKER_FEE_BPS;
-      this.store.label(tick.ts,tick.symbol,label.bucket,netBps);
-      this.pendingLabels.splice(i,1);
+      this.store.label(tick.ts,tick.symbol,outcome.bucket,netBps);
+      this.store.completePendingOutcome(outcome.id);
+      this.store.event('hypothetical_outcome_recorded',{symbol:tick.symbol,horizonSeconds:outcome.horizonSeconds,netBps},tick.ts);
     }
   }
   async reviewIfDue(now=Date.now()) {
@@ -163,7 +181,7 @@ export class BotEngine {
       const candidates=[...this.rules.values()].filter(r=>r.status==='TRADING'&&r.quoteAsset==='USDT')
         .sort((a,b)=>(this.latest.get(b.symbol)?.quoteVolume24h??0)-(this.latest.get(a.symbol)?.quoteVolume24h??0))
         .slice(0,100).map(r=>r.symbol);
-      const proposal=await this.reviewer.review({strategy:this.strategy,caps:this.caps,metrics:{portfolio:this.paper.portfolio(this.latest),evidence,candidateCount:this.rules.size},candidates});
+      const proposal=await this.reviewer.review({strategy:this.strategy,caps:this.caps,metrics:{portfolio:this.paper.portfolio(this.latest),evidence,candidateCount:this.rules.size,monitoredMarketCount:this.monitoredMarketCount,exploratoryPaper:true,exploratoryGateFailures:this.jevGateFailures},candidates});
       this.store.usage(Date.now(),'openai',proposal.inputTokens,proposal.outputTokens,proposal.costUsd);
       this.latestReview=proposal.summary.slice(0,240);this.store.set('latestReview',this.latestReview);
       let applied=false;
@@ -193,9 +211,10 @@ export class BotEngine {
     }
   }
   apiSpendToday() { const since=new Date(`${utcDay(Date.now())}T00:00:00.000Z`).getTime(); return Object.values(this.store.usageSince(since)).reduce((sum,u)=>sum+u.costUsd,0); }
-  recordPortfolio(now=Date.now()) { this.store.portfolioPoint(now,this.paper.portfolio(this.latest).portfolioUsdt); }
-  control(action:string,caps?:Partial<RiskCaps>) {
-    if(action==='pause') {for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);this.paused=true;this.store.set('paused',true);}
+  recordPortfolio(now=Date.now()) { this.store.portfolioPoint(now,this.paper.portfolio(this.latest).portfolioUsdt,this.portfolioRunId); }
+  control(action:string,caps?:Partial<RiskCaps>,startingUsdt?:number) {
+    if(action==='restart'&&this.stopped) {this.stopped=false;this.paused=true;this.store.set('stopped',false);this.store.set('paused',true);}
+    else if(action==='pause') {for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);this.paused=true;this.store.set('paused',true);}
     else if(action==='resume'&&!this.stopped&&!this.liquidationPending) {this.paused=false;this.store.set('paused',false);}
     else if(action==='liquidate') {
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
@@ -216,6 +235,16 @@ export class BotEngine {
       if(symbol) {const tick=this.latest.get(symbol);if(tick?.bookTs&&Date.now()-tick.bookTs<=3_000) this.paper.sell(tick,'emergency_stop',this.slippageBps(symbol));}
       this.stopped=true;this.paused=true;this.store.set('stopped',true);this.store.set('paused',true);
     }
+    else if(action==='start-paper') {
+      if(this.stopped) throw new Error('A stopped bot must be restarted before starting a new run');
+      if(!this.paused) throw new Error('Pause trading before starting a new paper run');
+      if(typeof startingUsdt!=='number') throw new Error('Starting USDT is required');
+      this.paper.startWithBalance(startingUsdt);
+      this.caps={...this.caps,floatUsdt:startingUsdt};this.paper.setCaps(this.caps);this.store.set('caps',this.caps);
+      this.portfolioRunId=this.store.startPortfolioRun(Date.now());
+      this.recordPortfolio();
+      this.paused=false;this.store.set('paused',false);
+    }
     else if(action==='set-caps'&&caps) {
       const allowed=['floatUsdt','maxOrderUsdt','dailyLossStopUsdt','dailyApiSpendUsd'];
       if(Object.keys(caps).some(k=>!allowed.includes(k))) throw new Error('Unsupported cap');
@@ -230,7 +259,7 @@ export class BotEngine {
     const usage=this.store.usageSince(since);const jev=usage.jev??emptyUsage();const openai=usage.openai??emptyUsage();
     const balances=this.paper.portfolio(this.latest);
     const candidates=[...this.rules.values()].filter(r=>r.status==='TRADING'&&r.quoteAsset==='USDT').length;
-    return {mode:'paper' as const,paused:this.paused,stopped:this.stopped,liquidationPending:this.liquidationPending,health:this.health,balances,usage:{jev,openai,totalCostUsd:jev.costUsd+openai.costUsd},caps:this.caps,strategy:this.strategy,latestReview:this.latestReview,openOrders:this.paper.openOrders.map(o=>({id:o.id,symbol:o.symbol,side:o.side,price:o.limitPrice,quantity:o.remainingQuantity,ts:o.createdTs,status:o.status,filledQuantity:o.filledQuantity})),recentTrades:this.store.trades(20),recentEvents:this.store.recentEvents(20),skippedReasons:this.skippedReasons,metrics:{decisions:this.decisions,approved:this.approved,avgDecisionLatencyMs:this.decisions?this.latencyTotal/this.decisions:0},candidateCount:candidates,updatedAt:Date.now()};
+    return {mode:'paper' as const,paused:this.paused,stopped:this.stopped,liquidationPending:this.liquidationPending,health:this.health,balances,usage:{jev,openai,totalCostUsd:jev.costUsd+openai.costUsd},caps:this.caps,strategy:this.strategy,latestReview:this.latestReview,openOrders:this.paper.openOrders.map(o=>({id:o.id,symbol:o.symbol,side:o.side,price:o.limitPrice,quantity:o.remainingQuantity,ts:o.createdTs,status:o.status,filledQuantity:o.filledQuantity})),recentTrades:this.store.trades(20),recentEvents:this.store.recentEvents(20),skippedReasons:this.skippedReasons,jevGateFailures:this.jevGateFailures,metrics:{decisions:this.decisions,approved:this.approved,avgDecisionLatencyMs:this.decisions?this.latencyTotal/this.decisions:0},candidateCount:candidates,monitoredMarketCount:this.monitoredMarketCount,portfolioRunId:this.portfolioRunId,updatedAt:Date.now()};
   }
   private slippageBps(symbol:string) { return Math.max(0,Math.min(10,this.features.get(symbol)?.estimatedSlippageBps??10)); }
 }
@@ -246,3 +275,4 @@ function opportunityRank(f:MarketFeatures):number {
   return Math.min(200,f.return15s*10_000)+0.4*Math.min(200,f.return1m*10_000)
     +5*Math.min(5,f.relativeVolume1m)-f.spreadBps-2*f.estimatedSlippageBps;
 }
+import { randomUUID } from 'node:crypto';
