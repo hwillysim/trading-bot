@@ -49,7 +49,7 @@ export default function App(){
     setState(next);setCaps(next.caps);setMaxOrderInput(String(next.caps.maxOrderUsdt));setMaxPositionsInput(String(next.caps.maxPositions));capsDirty.current=false;
    }
    if(action==='set-caps')setCapsOpen(false);
-   setNotice(action==='start-paper'?'Paper run started':action==='restart'?'Trading restarted. The existing paper balance is retained.':action==='set-caps'?'Risk limits updated':`Bot ${action==='stop'?'stopped':action==='pause'?'paused':'resumed'}`);
+   setNotice(action==='disable-strategy-adjustments'?'Automatic adjustments disabled':action==='enable-strategy-adjustments'?'Automatic adjustments enabled':action==='start-paper'?'Paper run started':action==='restart'?'Trading restarted. The existing paper balance is retained.':action==='set-caps'?'Risk limits updated':`Bot ${action==='stop'?'stopped':action==='pause'?'paused':'resumed'}`);
   }catch(e){setNotice(e instanceof Error?e.message:'Control request failed')}
   finally{setSaving(false);setTimeout(()=>setNotice(''),3500)}
  }
