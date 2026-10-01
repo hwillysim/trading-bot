@@ -16,11 +16,12 @@ const feed=new BinanceMarketFeed(tick=>{
   features.add(tick);
   if(tick.ts-(lastFeatureAt.get(tick.symbol)??0)<1_000) return;
   lastFeatureAt.set(tick.symbol,tick.ts);
-  const f=features.calculate(tick.symbol,tick.ts);
-  if(f) engine.onFeatures(f);
+  const orderUsdt=Math.min(engine.caps.maxOrderUsdt,engine.caps.floatUsdt*engine.strategy.positionFraction);
+  const f=features.calculate(tick.symbol,tick.ts,orderUsdt);
+  if(f) {f.btcReturn15s=engine.features.get('BTCUSDT')?.return15s??0;f.ethReturn15s=engine.features.get('ETHUSDT')?.return15s??0;engine.onFeatures(f);}
 },rules=>engine.setRules(rules));
 function refreshPinnedSymbols() {
-  const symbols=[...new Set([...engine.paper.state.positions.map(position=>position.symbol),...engine.paper.openOrders.map(order=>order.symbol)])].sort();
+  const symbols=[...new Set([...engine.paper.state.positions.map(position=>position.symbol),...engine.paper.openOrders.map(order=>order.symbol),...engine.research.symbols])].sort();
   const key=symbols.join(',');
   if(key!==pinnedSymbols) {pinnedSymbols=key;feed.setPinnedSymbols(symbols);}
 }
@@ -44,8 +45,8 @@ const maintenance=setInterval(()=>{
   engine.scan();
   refreshPinnedSymbols();
   void engine.reviewIfDue();
-  engine.checkRollback();
-},5_000);
+
+},500);
 const cleanup=setInterval(()=>store.prune(Date.now()-7*24*60*60*1000),60*60*1000);
 const portfolioRecording=setInterval(()=>engine.recordPortfolio(),10_000);
 

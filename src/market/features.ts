@@ -6,7 +6,9 @@ export class RollingMarketFeatures {
   constructor(retentionMs = 5 * 60_000) { this.retentionMs = retentionMs; }
 
   add(tick: MarketTick): void {
-    const rows = this.observations.get(tick.symbol) ?? [];
+    let rows = this.observations.get(tick.symbol) ?? [];
+    if(rows.length&&tick.ts-rows[rows.length-1]!.ts>10_000)rows=[];
+    if(rows.length&&tick.ts<rows[rows.length-1]!.ts)return;
     rows.push(tick);
     const cutoff = tick.ts - this.retentionMs;
     let first = 0;
@@ -15,11 +17,11 @@ export class RollingMarketFeatures {
     this.observations.set(tick.symbol, rows);
   }
 
-  calculate(symbol: string, now = Date.now()): MarketFeatures | undefined {
+  calculate(symbol: string, now = Date.now(), orderUsdt=0.20): MarketFeatures | undefined {
     const rows = this.observations.get(symbol);
     if (!rows?.length) return undefined;
     const current = rows[rows.length - 1]!;
-    const priceAt = (row: MarketTick) => row.last || (row.bid + row.ask) / 2;
+    const priceAt = (row: MarketTick) => row.bid>0&&row.ask>0?(row.bid+row.ask)/2:row.last;
     const price = priceAt(current);
     if (!(price > 0)) return undefined;
     const firstPrice = (windowMs: number) => {
@@ -28,28 +30,33 @@ export class RollingMarketFeatures {
     };
     const oneMinute = rows.filter((row) => row.ts >= now - 60_000);
     const fiveMinutes = rows.filter((row) => row.ts >= now - 300_000);
-    const returns = priceReturns(oneMinute.map(priceAt));
-    const returns5m = priceReturns(fiveMinutes.map(priceAt));
+    // Sample once per second so volatility does not depend on message frequency.
+    const seconds=new Map<number,number>();
+    for(const row of oneMinute) seconds.set(Math.floor(row.ts/1000),priceAt(row));
+    const returns=priceReturns([...seconds.values()]);
     const traded = (windowMs: number) => rows.filter((row) => row.ts >= now - windowMs && row.tradeQty !== undefined);
-    const tradeValue = (windowMs: number) => traded(windowMs).reduce((sum, row) => sum + priceAt(row) * row.tradeQty!, 0);
+    const tradeValue = (windowMs: number) => traded(windowMs).reduce((sum, row) => sum + row.last * row.tradeQty!, 0);
     const flow = traded(60_000).reduce((totals, row) => {
-      totals[row.tradeBuyerIsMaker ? 'sell' : 'buy'] += priceAt(row) * row.tradeQty!;
+      totals[row.tradeBuyerIsMaker ? 'sell' : 'buy'] += row.last * row.tradeQty!;
       return totals;
     }, { buy: 0, sell: 0 });
-    const bidDepthUsdt = current.bid * current.bidQty;
-    const askDepthUsdt = current.ask * current.askQty;
+    const freshDepth=!!current.depthTs && now-current.depthTs<=3_000;
+    const bids=freshDepth&&current.bids?.length?current.bids:[[current.bid,current.bidQty]];
+    const asks=freshDepth&&current.asks?.length?current.asks:[[current.ask,current.askQty]];
+    const bidDepthUsdt=bids.reduce((sum,[p,q])=>sum+p!*q!,0);
+    const askDepthUsdt=asks.reduce((sum,[p,q])=>sum+p!*q!,0);
     const depthUsdt = bidDepthUsdt + askDepthUsdt;
     const spreadBps = current.bid > 0 && current.ask > 0
       ? (current.ask - current.bid) / ((current.ask + current.bid) / 2) * 10_000
       : 10_000;
-    const orderUsdt = 0.20;
+
     const availableDepthUsdt = Math.min(bidDepthUsdt, askDepthUsdt);
     const depthShortfall = Math.max(0, orderUsdt - availableDepthUsdt) / orderUsdt;
     const quoteVolume1m = tradeValue(60_000);
     const quoteVolume5m = tradeValue(300_000);
     return {
       ...current,
-      ts: now,
+      ts: current.ts,
       last: price,
       return15s: ratioReturn(price, firstPrice(15_000)),
       return1m: ratioReturn(price, firstPrice(60_000)),
@@ -61,7 +68,12 @@ export class RollingMarketFeatures {
       spreadBps,
       bookImbalance: current.bidQty + current.askQty ? (current.bidQty - current.askQty) / (current.bidQty + current.askQty) : 0,
       depthUsdt,
-      estimatedSlippageBps: Math.min(10_000, spreadBps / 2 + depthShortfall * 100),
+      historySeconds:Math.max(0,(now-rows[0]!.ts)/1000),
+      volatility5sBps:stdev(returns)*Math.sqrt(5)*10_000,
+      buyFlow5s:traded(5_000).filter(row=>!row.tradeBuyerIsMaker).reduce((sum,row)=>sum+row.last*row.tradeQty!,0),
+      sellFlow5s:traded(5_000).filter(row=>row.tradeBuyerIsMaker).reduce((sum,row)=>sum+row.last*row.tradeQty!,0),
+      recentPath:[60,30,15,5,0].map(secondsAgo=>({secondsAgo,returnBps:ratioReturn(firstPrice(secondsAgo*1000),firstPrice(60_000))*10_000})),
+      estimatedSlippageBps: Math.min(10_000, depthShortfall * 100 + bookImpact(asks,orderUsdt,current.ask)),
     };
   }
 
@@ -79,4 +91,10 @@ function stdev(values: number[]): number {
   if (values.length < 2) return 0;
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
   return Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+}
+
+function bookImpact(levels:number[][],notional:number,best:number):number {
+  let remaining=notional,quantity=0,spent=0;
+  for(const [price,qty] of levels){if(!price||!qty)continue;const value=Math.min(remaining,price*qty);spent+=value;quantity+=value/price;remaining-=value;if(remaining<=0)break;}
+  return quantity&&best>0?Math.max(0,(spent/quantity/best-1)*10_000):10_000;
 }

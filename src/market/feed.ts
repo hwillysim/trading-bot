@@ -1,11 +1,11 @@
 import type { MarketTick, SymbolRules } from '../shared/types.ts';
 import { fetchExchangeRules } from './rules.ts';
 
-const BINANCE_WS = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
+const BINANCE_WS = 'wss://stream.binance.com:9443/stream?streams=!miniTicker@arr';
 const MAX_CANDIDATES = 40;
 const RESUBSCRIBE_INTERVAL_MS = 30_000;
 
-type MiniTicker = { s?: string; c?: string; q?: string; P?: string };
+type MiniTicker = { s?: string; c?: string; q?: string; o?: string; P?: string };
 type SocketLike = WebSocket;
 
 export class BinanceMarketFeed {
@@ -100,6 +100,8 @@ export class BinanceMarketFeed {
   private handleMessage(raw: string): void {
     let message: unknown;
     try { message = JSON.parse(raw); } catch { return; }
+    const wrapped = message as {data?:unknown};
+    if (wrapped && typeof wrapped === 'object' && Array.isArray(wrapped.data)) message=wrapped.data;
     if (Array.isArray(message)) {
       const tickers = message as MiniTicker[];
       for (const item of tickers) {
@@ -108,7 +110,7 @@ export class BinanceMarketFeed {
         this.miniTickers.set(symbol, {
           last: positive(item.c),
           quoteVolume24h: positive(item.q),
-          priceChangePercent24h: finite(item.P),
+          priceChangePercent24h: item.P!==undefined ? finite(item.P) : positive(item.o) ? (positive(item.c)/positive(item.o)-1)*100 : 0,
         });
       }
       for (const item of tickers) {
@@ -132,22 +134,22 @@ export class BinanceMarketFeed {
     const envelope = message as { stream?: string; data?: Record<string, unknown>; e?: string };
     const data = envelope.data ?? message as Record<string, unknown>;
     const event = String(data.e ?? envelope.stream?.split('@')[1] ?? '');
-    const symbol = String(data.s ?? '');
+    const symbol = String(data.s ?? envelope.stream?.split('@')[0]?.toUpperCase() ?? '');
     if (!symbol || !this.allowed.has(symbol)) return;
     const current = this.latest.get(symbol) ?? emptyTick(symbol);
     const ts = Number(data.E ?? data.T ?? Date.now());
     if (event.includes('bookTicker') || ('b' in data && 'a' in data && 'u' in data)) {
-      this.publish({ ...current, ts, bookTs:ts, bid: positive(data.b), ask: positive(data.a), bidQty: positive(data.B), askQty: positive(data.A) });
+      this.publish({ ...current, ts, bookTs:ts, bid: positive(data.b), ask: positive(data.a), bidQty: positive(data.B), askQty: positive(data.A), bookUpdateId:finite(data.u) });
     } else if (event === 'trade' || event === 'aggTrade') {
       const quantity = positive(data.q);
       const updated = { ...current, ts, last: positive(data.p) || current.last, tradeQty: quantity, tradeBuyerIsMaker: Boolean(data.m) };
       this.publish(updated);
-    } else if (event.startsWith('depth')) {
-      const bids = Array.isArray(data.b) ? data.b : [];
-      const asks = Array.isArray(data.a) ? data.a : [];
-      const bidQty = bids.reduce((sum: number, row: unknown) => sum + (Array.isArray(row) ? positive(row[1]) : 0), 0);
-      const askQty = asks.reduce((sum: number, row: unknown) => sum + (Array.isArray(row) ? positive(row[1]) : 0), 0);
-      this.publish({ ...current, ts, bidQty: bidQty || current.bidQty, askQty: askQty || current.askQty });
+    } else if (event.startsWith('depth') || 'lastUpdateId' in data) {
+      const levels=(value:unknown):[number,number][]=>Array.isArray(value)?value.flatMap(row=>Array.isArray(row)&&positive(row[0])&&positive(row[1])?[[positive(row[0]),positive(row[1])] as [number,number]]:[]):[];
+      const bids=levels(data.bids??data.b),asks=levels(data.asks??data.a);
+      if(!bids.length||!asks.length) return;
+      this.publish({ ...current, ts, bookTs:ts, depthTs:ts, bids, asks,
+        bid:bids[0]![0],bidQty:bids[0]![1],ask:asks[0]![0],askQty:asks[0]![1],bookUpdateId:finite(data.lastUpdateId??data.u) });
     }
   }
 
@@ -167,7 +169,7 @@ export class BinanceMarketFeed {
   }
 
   private subscriptionSymbols(): string[] {
-    const pinned = [...this.pinnedSymbols].filter((symbol) => this.allowed.has(symbol));
+    const pinned = [...new Set(['BTCUSDT','ETHUSDT',...this.pinnedSymbols])].filter((symbol) => this.allowed.has(symbol));
     return [...new Set([...this.candidateSymbols, ...pinned])];
   }
 

@@ -11,6 +11,10 @@ export interface MarketTick {
   priceChangePercent24h: number;
   tradeQty?: number;
   tradeBuyerIsMaker?: boolean;
+  bids?: [number, number][];
+  asks?: [number, number][];
+  depthTs?: number;
+  bookUpdateId?: number;
 }
 
 export interface SymbolRules {
@@ -36,6 +40,13 @@ export interface MarketFeatures extends MarketTick {
   bookImbalance: number;
   depthUsdt: number;
   estimatedSlippageBps: number;
+  historySeconds?: number;
+  volatility5sBps?: number;
+  buyFlow5s?: number;
+  sellFlow5s?: number;
+  btcReturn15s?: number;
+  ethReturn15s?: number;
+  recentPath?: Array<{secondsAgo:number;returnBps:number}>;
 }
 
 export interface StrategyConfig {
@@ -73,6 +84,16 @@ export interface JevAssessment {
   outputTokens: number;
   costUsd: number;
   raw: unknown;
+  clearsCostsProbability?: number;
+  exhaustionProbability?: number;
+  forecasts?: Array<{horizonSeconds:number;expectedGrossBps:number;clearsCostsProbability?:number;probabilities:Record<string,number>}>;
+}
+
+export interface JevContext {
+  purpose: 'entry' | 'hold';
+  setup: string;
+  roundTripCostBps: number;
+  position?: {ageSeconds:number;netPnlBps:number;drawdownBps:number;remainingSeconds:number};
 }
 
 export interface ReviewProposal {

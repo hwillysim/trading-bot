@@ -90,3 +90,26 @@ test("reviewer rejects symbols outside the supplied candidate list", async () =>
   const reviewer = new OpenAIReviewer({ apiKey: "x", fetchImpl: reviewerFetch({ action: "patch", reason: "Test.", summary: "Change symbols.", patch: { entryConfidence: null, continuationProbability: null, reversalExitProbability: null, costBufferBps: null, targetHoldSeconds: null, positionFraction: null, selectedSymbols: ["UNKNOWN"] } }) });
   await assert.rejects(reviewer.review({ strategy, caps, metrics: {}, candidates: ["BTCUSDT"] }), /outside the candidate list/i);
 });
+
+test('JEV evaluates cost-clearing returns at matching horizons and validates all return bands',async()=>{
+ const bands={down_large:0,down_small:0,flat:.1,up_small:.1,up_medium:.8,up_large:0};
+ let sent:any;
+ const client=new JevClient({apiKey:'test',fetchImpl:async(_url,init)=>{
+  sent=JSON.parse(String(init?.body));const answers:any={...jevAnswers,clearsCosts:{noul:.7},exhaustion:{noul:.1}};
+  for(const h of [30,60,120]){answers[`return${h}`]={type:'choice',choice:'up_medium',probabilities:bands};answers[`clears${h}`]={type:'noul',noul:.7};}
+  return Response.json({answers,usage:{input_tokens:100,output_tokens:100}});
+ }});
+ const result=await client.assess(features,120,{purpose:'hold',setup:'early_acceleration',roundTripCostBps:24,position:{ageSeconds:30,netPnlBps:10,drawdownBps:2,remainingSeconds:270}});
+ assert.equal(Object.keys(sent.questions).length,12);assert.equal(sent.state.trade.position.remainingSeconds,270);
+ assert.match(sent.questions.clears30.instructions,/24.00 basis points.*30 seconds/);
+ assert.equal(result.forecasts?.length,3);assert.ok(Math.abs(result.forecasts![0]!.expectedGrossBps-32)<1e-12);assert.equal(result.exhaustionProbability,.1);
+});
+
+test('provider cancellation reaches the actual fetch signal',async()=>{
+ const controller=new AbortController();let observed:AbortSignal|undefined;
+ const client=new JevClient({apiKey:'test',fetchImpl:async(_url,init)=>{
+  observed=init!.signal as AbortSignal;return await new Promise<Response>((_resolve,reject)=>observed!.addEventListener('abort',()=>reject(new Error('aborted')),{once:true}));
+ }});
+ const pending=client.assess(features,120,undefined,controller.signal);controller.abort();
+ await assert.rejects(pending,/request failed/);assert.equal(observed?.aborted,true);
+});

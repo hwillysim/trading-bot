@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 export interface RecordedTrade {
   id: string; ts: number; symbol: string; side: 'BUY' | 'SELL'; quantity: number;
   price: number; notionalUsdt: number; feeUsdt: number; reason: string; mode: 'paper' | 'live';
+  netPnlUsdt?: number;
 }
 
 export interface ReviewEvidence {
@@ -45,7 +46,27 @@ export class Store {
   snapshot(ts: number, symbol: string, data: unknown) { this.db.prepare('INSERT INTO snapshots(ts,symbol,data) VALUES(?,?,?)').run(ts,symbol,JSON.stringify(data)); }
   decision(ts: number, symbol: string, verdict: string, data: unknown) { this.db.prepare('INSERT INTO decisions(ts,symbol,verdict,data) VALUES(?,?,?,?)').run(ts,symbol,verdict,JSON.stringify(data)); }
   trade(trade: RecordedTrade) { this.db.prepare('INSERT INTO trades(id,ts,symbol,side,data) VALUES(?,?,?,?,?)').run(trade.id,trade.ts,trade.symbol,trade.side,JSON.stringify(trade)); }
-  trades(limit=50): RecordedTrade[] { return (this.db.prepare('SELECT data FROM trades ORDER BY ts DESC LIMIT ?').all(limit) as {data:string}[]).map(r=>JSON.parse(r.data)); }
+  trades(limit=50): RecordedTrade[] {
+    const recent=(this.db.prepare('SELECT data FROM trades ORDER BY ts DESC, rowid DESC LIMIT ?').all(limit) as {data:string}[]).map(r=>JSON.parse(r.data) as RecordedTrade);
+    const missing=new Map(recent.filter(t=>t.side==='SELL'&&t.netPnlUsdt===undefined).map(t=>[t.id,t]));
+    if(!missing.size)return recent;
+    // Older journals did not record realised P/L. Match the complete journal so an
+    // entry outside the recent-trades window still contributes its fee and cost.
+    const entries=new Map<string,{quantity:number;cost:number}>();
+    for(const row of this.db.prepare('SELECT data FROM trades ORDER BY ts, rowid').all() as {data:string}[]) {
+      const trade=JSON.parse(row.data) as RecordedTrade,key=`${trade.mode}:${trade.symbol}`;
+      const entry=entries.get(key);
+      if(trade.side==='BUY') {
+        entries.set(key,{quantity:(entry?.quantity??0)+trade.quantity,cost:(entry?.cost??0)+trade.notionalUsdt+trade.feeUsdt});
+      } else if(entry&&entry.quantity>0) {
+        const allocatedCost=entry.cost*Math.min(1,trade.quantity/entry.quantity);
+        if(trade.quantity<=entry.quantity+1e-10&&missing.has(trade.id))missing.get(trade.id)!.netPnlUsdt=trade.notionalUsdt-trade.feeUsdt-allocatedCost;
+        entry.quantity-=trade.quantity;entry.cost-=allocatedCost;
+        if(entry.quantity<=1e-10)entries.delete(key);
+      }
+    }
+    return recent;
+  }
   label(ts:number,symbol:string,bucket:string,netBps:number) { this.db.prepare('INSERT INTO labels(ts,symbol,bucket,net_bps) VALUES(?,?,?,?)').run(ts,symbol,bucket,netBps); }
   labelValues(bucket:string,symbol:string,limit=500):number[] { return (this.db.prepare('SELECT net_bps FROM labels WHERE bucket=? AND symbol=? ORDER BY ts DESC LIMIT ?').all(bucket,symbol,limit) as {net_bps:number}[]).map(r=>r.net_bps); }
   addPendingOutcome(outcome:{id:string;decisionTs:number;dueTs:number;symbol:string;bucket:string;entryAsk:number;horizonSeconds:number}) {
@@ -108,12 +129,12 @@ export class Store {
     const symbolRegimeGroups=new Map<string,number[]>();
     for(const label of labels) {const values=labelGroups.get(label.bucket)??[];values.push(label.netBps);labelGroups.set(label.bucket,values);const key=`${label.symbol}|${label.bucket}`;const symbolValues=symbolRegimeGroups.get(key)??[];symbolValues.push(label.netBps);symbolRegimeGroups.set(key,symbolValues);}
     const labelValues=labels.map(label=>label.netBps),labelWins=labelValues.filter(value=>value>0).length;
-    const allTrades=(this.db.prepare('SELECT ts,side,data FROM trades WHERE ts<=? ORDER BY ts DESC LIMIT 1000').all(untilTs) as {ts:number;side:string;data:string}[]).map(row=>({...row,data:parseObject(row.data)})).reverse();
-    const entries=new Map<string,number>(),closed:number[]=[];
+    const allTrades=(this.db.prepare('SELECT ts,side,data FROM trades WHERE ts<=? ORDER BY ts').all(untilTs) as {ts:number;side:string;data:string}[]).map(row=>({...row,data:parseObject(row.data)}));
+    const entries=new Map<string,{cost:number;quantity:number}>(),closed:number[]=[];
     for(const row of allTrades) {
       const symbol=String(row.data.symbol);
-      if(row.side==='BUY') entries.set(symbol,(entries.get(symbol)??0)+Number(row.data.notionalUsdt));
-      else if(row.side==='SELL') {const entryCost=entries.get(symbol);if(entryCost!==undefined&&row.ts>=since&&row.ts<=untilTs){closed.push(Number(row.data.quantity)*Number(row.data.price)-Number(row.data.feeUsdt)-entryCost);entries.delete(symbol);}}
+      if(row.side==='BUY') {const entry=entries.get(symbol)??{cost:0,quantity:0};entry.cost+=Number(row.data.notionalUsdt)+Number(row.data.feeUsdt);entry.quantity+=Number(row.data.quantity);entries.set(symbol,entry);}
+      else if(row.side==='SELL') {const entry=entries.get(symbol);if(!entry)continue;const fraction=Math.min(1,Number(row.data.quantity)/entry.quantity),entryCost=entry.cost*fraction;if(fraction>=1-1e-9)entries.delete(symbol);else {entry.cost-=entryCost;entry.quantity-=Number(row.data.quantity);}if(row.ts>=since&&row.ts<=untilTs)closed.push(Number(row.data.notionalUsdt)-Number(row.data.feeUsdt)-entryCost);}
     }
     const usageRows=this.db.prepare('SELECT provider,COUNT(*) requests,SUM(cost_usd) costUsd,SUM(input_tokens) inputTokens,SUM(output_tokens) outputTokens FROM usage WHERE ts>=? AND ts<=? GROUP BY provider').all(since,untilTs) as {provider:string;requests:number;costUsd:number;inputTokens:number;outputTokens:number}[];
     const riskRows=this.db.prepare(`SELECT kind,COUNT(*) count FROM events WHERE ts>=? AND ts<=? AND kind IN ('feed_disconnected','jev_error','review_error','strategy_rollback','control') GROUP BY kind`).all(since,untilTs) as {kind:string;count:number}[];

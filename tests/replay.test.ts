@@ -14,14 +14,14 @@ test('replay enters after the decision and measures later executable bid quotes 
   const result=evaluateReplay([
     snapshot(1,100_000,101), // before the decision, must not become the entry
     snapshot(2,106_000,100),
-    snapshot(3,130_000,101), snapshot(4,220_000,102), snapshot(5,410_000,103),
+    snapshot(3,136_000,101), snapshot(4,226_000,102), snapshot(5,411_000,103),
   ],[decision(1,105_000,'approved')],{feeBps:10,slippageBps:5});
   const selected=result.summary.find(x=>x.signal==='signal:jev_policy');
   assert.ok(selected);
   assert.equal(selected.selectedDecisions,1);
   assert.equal(selected.actionRate,1);
   assert.equal(selected.horizons[30].covered,1);
-  assert.ok(Math.abs(selected.horizons[30].meanNetBps! - ((102/100.1-1)*10_000-30)) < 1e-8);
+  assert.ok(Math.abs(selected.horizons[30].meanNetBps! - ((101/100.1-1)*10_000-30)) < 1e-8);
   assert.equal(result.coverage.requested,3);
   assert.equal(result.coverage.covered,3);
   const noTrade=result.summary.find(x=>x.signal==='signal:no_trade');
@@ -35,7 +35,7 @@ test('momentum baseline selects positive short returns, and missing future quote
   const momentum=result.summary.find(x=>x.signal==='signal:momentum_baseline');
   const jev=result.summary.find(x=>x.signal==='signal:jev_policy');
   assert.equal(momentum?.horizons[30].meanNetBps, (101/100.1-1)*10_000);
-  assert.equal(jev?.horizons[30].meanNetBps,0);
+  assert.equal(jev?.horizons[30].meanNetBps,null);
   assert.equal(result.coverage.covered,1);
   assert.equal(result.coverage.requested,3);
   assert.equal(result.summary.some(x=>x.horizons[120].meanNetBps!==null),false);
@@ -77,3 +77,10 @@ test('database replay opens the Store schema in read-only mode',()=>{
 });
 
 function requireFileSize(path:string) { return statSync(path).size; }
+
+test('replay rejects quotes far beyond a requested horizon and reports returns per selected action',()=>{
+ const result=evaluateReplay([snapshot(1,10_000,100),snapshot(2,12_000,100),snapshot(3,45_000,101),snapshot(4,900_000,120)],[decision(1,10_000,'approved'),decision(2,11_000,'jev_threshold')],{feeBps:10,slippageBps:2});
+ const policy=result.summary.find(r=>r.signal==='signal:jev_policy')!;
+ assert.equal(policy.horizons[30].selectedCovered,1);assert.equal(policy.horizons[120].covered,0);
+ assert.equal(policy.horizons[30].meanNetBps!/2,policy.horizons[30].meanPerDecisionBps);
+});

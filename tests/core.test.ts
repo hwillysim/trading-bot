@@ -11,7 +11,7 @@ import { judgeEntry, validateReviewPatch } from '../src/core/policy.ts';
 import { Store } from '../src/core/store.ts';
 
 const now=Date.now();
-const features:MarketFeatures={symbol:'BTCUSDT',ts:now,last:100,bid:99.99,ask:100,bidQty:100,askQty:100,bookTs:now,quoteVolume24h:2_000_000,priceChangePercent24h:1,return15s:0.01,return1m:0.02,return5m:0.03,volatility1m:0.001,relativeVolume1m:2,buyFlow1m:1000,sellFlow1m:500,spreadBps:1,bookImbalance:0,depthUsdt:20_000,estimatedSlippageBps:0.5};
+const features:MarketFeatures={symbol:'BTCUSDT',ts:now,last:100,bid:99.99,ask:100,bidQty:100,askQty:100,bookTs:now,quoteVolume24h:2_000_000,priceChangePercent24h:1,return15s:0.001,return1m:0.002,return5m:0.003,historySeconds:60,volatility1m:0.001,relativeVolume1m:2,buyFlow1m:1000,sellFlow1m:500,spreadBps:1,bookImbalance:0,depthUsdt:20_000,estimatedSlippageBps:0.5};
 const rules:SymbolRules={symbol:'BTCUSDT',status:'TRADING',baseAsset:'BTC',quoteAsset:'USDT',minNotional:5,minQty:0.00001,stepSize:0.00001,tickSize:0.01};
 const assessment:JevAssessment={symbol:'BTCUSDT',ts:now,horizonSeconds:120,model:'jev-1.13.0',continuationProbability:0.9,reversalProbability:0.1,waitProbability:0.1,setupScore:3.5,setupConfidence:0.92,latencyMs:100,inputTokens:500,outputTokens:50,costUsd:0.000021,raw:{}};
 
@@ -41,7 +41,7 @@ test('review patch cannot change hard limits or jump thresholds',()=>{
   assert.equal(validateReviewPatch(DEFAULT_STRATEGY,{entryConfidence:0.99},['BTCUSDT']),null);
   assert.equal(validateReviewPatch(DEFAULT_STRATEGY,{maxHoldSeconds:999} as never,['BTCUSDT']),null);
   assert.equal(validateReviewPatch(DEFAULT_STRATEGY,{selectedSymbols:['UNKNOWN']},['BTCUSDT']),null);
-  assert.equal(validateReviewPatch(DEFAULT_STRATEGY,{selectedSymbols:['BTCUSDT']},['BTCUSDT'])?.version,2);
+  assert.equal(validateReviewPatch(DEFAULT_STRATEGY,{selectedSymbols:['BTCUSDT']},['BTCUSDT'])?.version,DEFAULT_STRATEGY.version+1);
 });
 
 test('paper ledger charges both fees and reports loss',()=>{
@@ -125,7 +125,7 @@ test('paper broker keeps separate positions and reserves no more than the config
   } finally {store.close();}
 });
 
-test('maximum open positions accepts only one to five and persists across restart',()=>{
+test('maximum open positions accepts one to fifty and persists across restart',()=>{
   const directory=mkdtempSync(join(tmpdir(),'trading-bot-positions-'));
   const path=join(directory,'bot.sqlite');
   try {
@@ -133,12 +133,12 @@ test('maximum open positions accepts only one to five and persists across restar
     const engine=new BotEngine(first,null,null);
     assert.throws(()=>engine.control('set-caps',{maxPositions:0}));
     assert.throws(()=>engine.control('set-caps',{maxPositions:1.5}));
-    assert.throws(()=>engine.control('set-caps',{maxPositions:6}));
-    engine.control('set-caps',{maxPositions:2});
-    assert.equal(engine.caps.maxPositions,2);
+    assert.throws(()=>engine.control('set-caps',{maxPositions:51}));
+    engine.control('set-caps',{maxPositions:12});
+    assert.equal(engine.caps.maxPositions,12);
     first.close();
     const second=new Store(path);
-    try {assert.equal(new BotEngine(second,null,null).caps.maxPositions,2);}
+    try {assert.equal(new BotEngine(second,null,null).caps.maxPositions,12);}
     finally {second.close();}
   } finally {rmSync(directory,{recursive:true,force:true});}
 });
@@ -232,21 +232,22 @@ test('pending hypothetical outcomes survive restart and never create paper fills
   } finally {store.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('a rejected exploratory JEV assessment still queues its hypothetical outcome',async()=>{
+test('a rejected cost-aware assessment still starts shadow comparisons',async()=>{
   const store=new Store(':memory:');
   try {
-    const lowAssessment={...assessment,setupScore:2,setupConfidence:.4,continuationProbability:.4,waitProbability:.3};
+    const lowAssessment={...assessment,setupScore:2,setupConfidence:.4,continuationProbability:.4,waitProbability:.3,clearsCostsProbability:.6,exhaustionProbability:.2,forecasts:[{horizonSeconds:120,expectedGrossBps:40,probabilities:{up_medium:1}}]};
     const engine=new BotEngine(store,{assess:async()=>lowAssessment},null);
+    engine.control('set-caps',{floatUsdt:1000,maxOrderUsdt:20});
     engine.setRules([rules]);
     engine.setFeedConnected(true);
     engine.onTick(features);
     engine.onFeatures(features);
     engine.scan(now);
     await new Promise(resolve=>setTimeout(resolve,0));
-    assert.equal(store.pendingOutcomes().length,1);
+    assert.equal(engine.research.activeCount,1);
     const decision=store.db.prepare('SELECT verdict,data FROM decisions ORDER BY id DESC LIMIT 1').get() as {verdict:string;data:string};
-    assert.equal(decision.verdict,'exploratory_jev_threshold');
-    assert.deepEqual(JSON.parse(decision.data).exploratoryGateFailures,['setupConfidence','continuationProbability']);
+    assert.equal(decision.verdict,'jev_signal_weak');
+    assert.equal(JSON.parse(decision.data).experimentVersion,2);
     assert.equal(store.trades().length,0);
   } finally {store.close();}
 });
@@ -271,7 +272,7 @@ test('reviewer patch is ignored without a measured performance problem',async()=
     const engine=new BotEngine(store,null,reviewer);
     engine.setRules([rules]);
     await engine.reviewIfDue(Date.now());
-    assert.equal(engine.strategy.version,1);
+    assert.equal(engine.strategy.version,DEFAULT_STRATEGY.version);
     assert.equal(store.reviews(1).length,1);
   } finally {store.close();}
 });
@@ -347,6 +348,35 @@ test('emergency stop closes each holding before restart is allowed',()=>{
     assert.equal(engine.paper.state.positions.length,0);
     engine.control('restart');
     assert.equal(engine.stopped,false);
-    assert.equal(engine.paused,true);
+    assert.equal(engine.paused,false);
   } finally {store.close();}
+});
+
+test('recent sale P/L matches full history, includes both fees and allocates partial exits',()=>{
+ const store=new Store(':memory:');
+ const record=(id:string,ts:number,side:'BUY'|'SELL',quantity:number,notionalUsdt:number,feeUsdt:number)=>store.trade({id,ts,symbol:'BTCUSDT',side,quantity,price:notionalUsdt/quantity,notionalUsdt,feeUsdt,reason:'test',mode:'paper'});
+ record('old-entry',1,'BUY',2,200,.2);
+ record('partial-profit',2,'SELL',1,110,.11);
+ record('partial-loss',3,'SELL',1,90,.09);
+ const trades=store.trades(2);
+ assert.ok(Math.abs(trades[0]!.netPnlUsdt!-(-10.19))<1e-9);
+ assert.ok(Math.abs(trades[1]!.netPnlUsdt!-9.79)<1e-9);
+ record('new-entry',4,'BUY',1,50,.05);
+ record('new-exit',5,'SELL',1,55,.055);
+ assert.ok(Math.abs(store.trades(1)[0]!.netPnlUsdt!-4.895)<1e-9);
+ record('unknown-entry-exit',6,'SELL',1,60,.06);
+ assert.equal(store.trades(1)[0]!.netPnlUsdt,undefined);
+ store.close();
+});
+
+test('new sale records the same fee-net P/L as the paper balance ledger',()=>{
+ const store=new Store(':memory:'),paper=new PaperBroker(store,{...DEFAULT_CAPS,floatUsdt:100,maxOrderUsdt:20}),ts=Date.now();
+ paper.startWithBalance(100);
+ const tick={symbol:'BTCUSDT',ts,last:100,bid:100,ask:100,bidQty:100,askQty:100,quoteVolume24h:1_000_000,priceChangePercent24h:0};
+ assert.ok(paper.buy(tick,20,'test'));
+ const before=paper.state.realisedPnlUsdt;
+ const sale=paper.sell({...tick,ts:ts+1000,bid:101},'test');
+ assert.ok(sale);assert.equal(sale.netPnlUsdt,paper.state.realisedPnlUsdt-before);
+ assert.equal(store.trades(1)[0]!.netPnlUsdt,sale.netPnlUsdt);
+ store.close();
 });

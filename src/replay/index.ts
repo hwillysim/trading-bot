@@ -29,7 +29,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
     const rows = bySymbol.get(row.symbol) ?? [];
     rows.push(quote); bySymbol.set(row.symbol, rows);
   }
-  const groups = new Map<string, { decisions:number; actions:number; outcomes:Record<number,{covered:number;netBps:number[]}> }>();
+  const groups = new Map<string, { decisions:number; actions:number; outcomes:Record<number,{covered:number;netBps:number[];selectedNetBps:number[]}> }>();
   const sorted = [...decisions].sort((a,b)=>a.ts-b.ts||a.id-b.id);
   let totalOutcomes = 0, coveredOutcomes = 0;
   for (const decision of sorted) {
@@ -40,7 +40,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
     const startTs = decision.ts;
     const symbolQuotes = bySymbol.get(decision.symbol) ?? [];
     const entryQuote = firstQuoteAtOrAfter(symbolQuotes, startTs);
-    if (!entryQuote) continue;
+    if (!entryQuote||entryQuote.ts-startTs>6_500) continue;
     const regime = regimeOf(features);
     const momentum = finite(features.return15s) && finite(features.return1m) && features.return15s > 0 && features.return1m > 0;
     const jevSelected = decision.verdict === 'approved';
@@ -55,7 +55,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
     for (const horizon of HORIZONS) {
       totalOutcomes++;
       const quote = firstQuoteAtOrAfter(symbolQuotes, startTs + horizon * 1000);
-      futureQuotes.set(horizon, quote && quote.ts > startTs ? quote : undefined);
+      futureQuotes.set(horizon, quote && quote.ts > startTs && quote.ts-(startTs+horizon*1000)<=6_500 ? quote : undefined);
       if (futureQuotes.get(horizon)) coveredOutcomes++;
     }
     const keySet = new Set<string>();
@@ -63,7 +63,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
       const key = `${signal}|${bucket}|${symbol}`;
       if (keySet.has(key)) continue;
       keySet.add(key);
-      const group = groups.get(key) ?? {decisions:0,actions:0,outcomes:Object.fromEntries(HORIZONS.map(h=>[h,{covered:0,netBps:[]}]))};
+      const group = groups.get(key) ?? {decisions:0,actions:0,outcomes:Object.fromEntries(HORIZONS.map(h=>[h,{covered:0,netBps:[],selectedNetBps:[]}]))};
       group.decisions++;
       const selected = signal === 'signal:momentum_baseline' ? momentum
         : signal === 'signal:no_trade' ? false : signal === 'signal:jev_exploratory' ? exploratorySelected : jevSelected;
@@ -76,6 +76,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
         const friction = (options.feeBps + options.slippageBps) * 2;
         const netBps = (quote.bid / entryQuote.ask - 1) * 10_000 - friction;
         group.outcomes[horizon]!.netBps.push(selected ? netBps : 0);
+        if(selected)group.outcomes[horizon]!.selectedNetBps.push(netBps);
       }
     }
   }
@@ -83,7 +84,7 @@ export function evaluateReplay(snapshots: ReplaySnapshot[], decisions: ReplayDec
     const [signal, regime, symbol] = key.split('|');
     return { signal, regime, symbol, decisions: group.decisions, selectedDecisions:group.actions, actionRate:group.decisions?group.actions/group.decisions:0, horizons: Object.fromEntries(HORIZONS.map(h => {
       const values = group.outcomes[h]!.netBps;
-      return [h, {covered:group.outcomes[h]!.covered,coverage:group.decisions ? group.outcomes[h]!.covered/group.decisions : 0,meanNetBps:mean(values)}];
+      return [h, {covered:group.outcomes[h]!.covered,coverage:group.decisions ? group.outcomes[h]!.covered/group.decisions : 0,meanNetBps:signal==='signal:no_trade'?mean(values):mean(group.outcomes[h]!.selectedNetBps),meanPerDecisionBps:mean(values),selectedCovered:group.outcomes[h]!.selectedNetBps.length}];
     })) };
   });
   return { options, counts:{snapshots:snapshots.length,decisions:decisions.length}, coverage:{requested:totalOutcomes,covered:coveredOutcomes,ratio:totalOutcomes?coveredOutcomes/totalOutcomes:0}, summary };

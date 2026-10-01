@@ -1,15 +1,23 @@
-import type { JevAssessment, MarketFeatures, MarketTick, ReviewProposal, RiskCaps, StrategyConfig, SymbolRules } from '../shared/types.ts';
+import type { JevAssessment, MarketFeatures, MarketTick, ReviewProposal, RiskCaps, StrategyConfig, SymbolRules, JevContext } from '../shared/types.ts';
 import { DEFAULT_CAPS, DEFAULT_STRATEGY, PAPER_SLIPPAGE_BPS, TAKER_FEE_BPS, utcDay } from './defaults.ts';
-import { judgeEntry, regimeBucket, validateReviewPatch, type EdgeStats } from './policy.ts';
+import { type EdgeStats } from './policy.ts';
 import { PaperBroker } from './paper.ts';
 import { Store } from './store.ts';
+import { ResearchTracker } from './research.ts';
+import { MANAGEMENT, MAX_POSITIONS, advanceStop, calibrationBucket, detectSetup, exitReason, makePlan, selectForecast, signalVerdict, tradingCostsBps, type PositionPlan, type Setup } from './adaptive.ts';
 
-export interface AssessmentClient { assess(features:MarketFeatures,horizonSeconds?:number):Promise<JevAssessment> }
-export interface ReviewClient { review(input:{strategy:StrategyConfig;caps:RiskCaps;metrics:unknown;candidates:string[]}):Promise<ReviewProposal> }
+export interface AssessmentClient { assess(features:MarketFeatures,horizonSeconds?:number,context?:JevContext,signal?:AbortSignal):Promise<JevAssessment> }
+export interface ReviewClient { review(input:{strategy:StrategyConfig;caps:RiskCaps;metrics:unknown;candidates:string[]},signal?:AbortSignal):Promise<ReviewProposal> }
 const emptyUsage=()=>({inputTokens:0,outputTokens:0,costUsd:0,requests:0});
 
 export class BotEngine {
   readonly store:Store;
+  readonly research:ResearchTracker;
+  private requests=new Set<AbortController>();
+  private receivedAt=new Map<string,number>();
+  private busySymbols=new Set<string>();
+  private retryAt=0;
+  private plans:Record<string,PositionPlan>;
   private jev:AssessmentClient|null;
   private reviewer:ReviewClient|null;
   caps:RiskCaps;
@@ -30,21 +38,23 @@ export class BotEngine {
   decisions=0;
   approved=0;
   private latencyTotal=0;
-  private lastAssessmentStarted=0;
   private lastAssessed=new Map<string,number>();
   private assessing=0;
   private lastReviewTs=0;
   private reviewing=false;
   private lastSnapshot=new Map<string,number>();
   portfolioRunId:number;
-  private previousStrategy:StrategyConfig|null=null;
-  private patchTradeCount=0;
-  private patchPnl=0;
   constructor(store:Store,jev:AssessmentClient|null,reviewer:ReviewClient|null) {
-    this.store=store;this.jev=jev;this.reviewer=reviewer;
+    this.store=store;this.jev=jev;this.reviewer=reviewer;this.research=new ResearchTracker(store);this.plans=store.get('positionPlansV2',{});
     this.caps=store.get('caps',{...DEFAULT_CAPS});
     this.portfolioRunId=store.currentPortfolioRunId();
-    this.strategy=store.get('strategy',{...DEFAULT_STRATEGY});
+    const savedStrategy=store.get<StrategyConfig|null>('strategy',null);this.strategy=savedStrategy??{...DEFAULT_STRATEGY};
+    if(store.get('experimentVersion',0)<2) {
+      this.strategy={...DEFAULT_STRATEGY,version:savedStrategy?this.strategy.version+1:DEFAULT_STRATEGY.version,positionFraction:this.strategy.positionFraction,selectedSymbols:this.strategy.selectedSymbols};
+      if(this.caps.maxPositions===5)this.caps={...this.caps,maxPositions:10};
+      store.set('strategy',this.strategy);store.set('caps',this.caps);store.set('experimentVersion',2);
+      store.event('experiment_started',{version:2,summary:'Cost-aware entries and bounded JEV position management; existing ledger retained'});
+    }
     this.paused=store.get('paused',false);
     this.stopped=store.get('stopped',false);
     this.liquidationPending=store.get('liquidationPending',false);
@@ -83,76 +93,111 @@ export class BotEngine {
       const trade=this.paper.sell(tick,reason,this.slippageBps(tick.symbol));
       if(trade) {if(this.liquidationPending){this.liquidationPending=this.paper.state.positions.length>0;this.store.set('liquidationPending',this.liquidationPending);}this.store.event('paper_exit',{symbol:tick.symbol,reason,notionalUsdt:trade.notionalUsdt});}
     } else if(p?.symbol===tick.symbol && freshBook) {
-      const age=(tick.ts-p.entryTs)/1000;
-      const stop=tick.bid <= p.entryPrice*0.992;
-      const trail=age>=15 && tick.bid <= p.peakBid*0.996;
-      const reversal=(this.assessments.get(tick.symbol)?.reversalProbability??0)>this.strategy.reversalExitProbability;
-      const target=age>=this.strategy.targetHoldSeconds && tick.bid>p.entryPrice && tick.bid<p.peakBid*0.998;
-      const max=age>=this.caps.maxHoldSeconds;
-      if(stop||trail||reversal||target||max) {
-        const trade=this.paper.sell(tick,stop?'protective_stop':trail?'trailing_reversal':reversal?'jev_reversal':target?'target_hold_exit':'max_hold_exit',this.slippageBps(tick.symbol));
-        if(trade) this.store.event('paper_exit',{symbol:tick.symbol,reason:trade.reason,notionalUsdt:trade.notionalUsdt});
+      const f=this.features.get(tick.symbol);
+      let plan=this.plans[tick.symbol];
+      if(!plan) {
+        const a=this.assessments.get(tick.symbol);
+        if(f&&a)plan=makePlan(f,a,detectSetup(f)??'early_acceleration',p.entryPrice,p.entryTs,this.caps.maxHoldSeconds);
+        else plan={setup:'early_acceleration',horizonSeconds:120,deadlineTs:p.entryTs+Math.min(this.caps.maxHoldSeconds,300)*1000,plannedExitTs:p.entryTs+120_000,dipBps:20,stopBid:p.entryPrice*.992,expectedGrossBps:0,entryAssessmentTs:p.entryTs};
+        this.plans[tick.symbol]=plan;
       }
+      const oldStop=plan.stopBid;
+      advanceStop(plan,p.peakBid,(tick.ts-p.entryTs)/1000);
+      // Pausing stops providers. Local stops and the planned deadline still run.
+      const reason=exitReason(plan,tick,p.entryPrice,this.assessments.get(tick.symbol),this.receivedAt.get(tick.symbol)??0,!this.paused);
+      if(reason) {
+        const trade=this.paper.sell(tick,reason,this.slippageBps(tick.symbol));
+        if(trade) {if(!this.paper.position(tick.symbol))delete this.plans[tick.symbol];this.store.event('paper_exit',{symbol:tick.symbol,reason:trade.reason,notionalUsdt:trade.notionalUsdt});}
+      }
+      if(reason||plan.stopBid!==oldStop)this.store.set('positionPlansV2',this.plans);
     }
+    if(!this.paper.position(tick.symbol)&&this.plans[tick.symbol]){delete this.plans[tick.symbol];this.store.set('positionPlansV2',this.plans);}
+    this.research.tick(tick,this.paused?undefined:this.assessments.get(tick.symbol),this.receivedAt.get(tick.symbol)??0);
   }
+
   onFeatures(f:MarketFeatures) {
     this.features.set(f.symbol,f);
   }
   scan(now=Date.now()) {
-    const expired=this.paper.expireOrders(now);
-    if(expired)this.store.event('paper_orders_expired',{count:expired});
-    if(this.stopped||this.paused||!this.jev||!this.health.feedConnected) return;
-    if(now-this.lastAssessmentStarted<5_000 || this.assessing>=2) return;
-    if(this.apiSpendToday()>=this.caps.dailyApiSpendUsd) return;
-    const ranked=[...this.features.values()].filter(f=>{
-      if(this.strategy.selectedSymbols.length&&!this.strategy.selectedSymbols.includes(f.symbol)) return false;
-      if(!this.rules.has(f.symbol)||now-f.ts>3_000||!f.bookTs||now-f.bookTs>3_000) return false;
-      if(f.quoteVolume24h<1_000_000||f.depthUsdt<2_000||f.spreadBps>25||f.estimatedSlippageBps>10) return false;
-      if(f.return15s<0.0005||f.return1m<0.0005||f.relativeVolume1m<0.8) return false;
-      return now-(this.lastAssessed.get(f.symbol)??0)>30_000;
-    }).sort((a,b)=>opportunityRank(b)-opportunityRank(a));
-    const slots=Math.min(2-this.assessing,2,ranked.length);
-    for(let i=0;i<slots;i++) {
-      const f=ranked[i];
-      this.lastAssessed.set(f.symbol,now);
-      this.assessing++;
-      void this.assess(f).finally(()=>{this.assessing--;});
+    this.research.flush(now);
+    this.paper.expireOrders(now);
+    this.checkDeadlines(now);
+    if(this.stopped||this.paused||!this.jev||!this.health.feedConnected||now<this.retryAt) return;
+    // Reserve a conservative request cost so concurrent requests cannot bypass the budget.
+    if(this.apiSpendToday()+this.requests.size*0.002>=this.caps.dailyApiSpendUsd) return;
+    const fresh=(f:MarketFeatures)=>now-f.ts>=0&&now-f.ts<=3_000&&!!f.bookTs&&now-f.bookTs>=0&&now-f.bookTs<=3_000;
+    const managed=[...new Set([...this.paper.state.positions.map(p=>p.symbol),...this.research.symbols])]
+      .filter(symbol=>!this.busySymbols.has(symbol)&&now-(this.lastAssessed.get(symbol)??0)>=MANAGEMENT.reassessMs)
+      .sort((a,b)=>(this.lastAssessed.get(a)??0)-(this.lastAssessed.get(b)??0));
+    const capacity=Math.max(0,8-this.assessing);
+    let started=0;
+    for(const symbol of managed) {
+      if(started>=Math.min(6,capacity))break;
+      const f=this.features.get(symbol);if(!f||!fresh(f))continue;
+      this.startAssessment(f,now,true);started++;
     }
-    if(slots) this.lastAssessmentStarted=now;
+    const ranked=[...this.features.values()].filter(f=>fresh(f)&&!this.busySymbols.has(f.symbol)
+      &&(!this.strategy.selectedSymbols.length||this.strategy.selectedSymbols.includes(f.symbol))
+      &&this.rules.has(f.symbol)&&f.quoteVolume24h>=1_000_000&&f.depthUsdt>=2_000&&f.spreadBps<=15&&f.estimatedSlippageBps<=10
+      &&detectSetup(f)&&now-(this.lastAssessed.get(f.symbol)??0)>=5_000)
+      .sort((a,b)=>opportunityRank(b)-opportunityRank(a));
+    for(const f of ranked.slice(0,Math.min(2,capacity-started))) this.startAssessment(f,now,false);
   }
-  private async assess(f:MarketFeatures) {
-    try {
-      const horizonSeconds=this.strategy.targetHoldSeconds;
-      const a=await this.jev!.assess(f,horizonSeconds);
-      this.assessments.set(f.symbol,a);
-      this.store.usage(Date.now(),'jev',a.inputTokens,a.outputTokens,a.costUsd);
-      const decisionTs=Date.now();
-      const decisionQuote=this.latest.get(f.symbol);
-      const freshQuote=decisionQuote&&decisionQuote.bookTs&&decisionQuote.bookTs<=decisionQuote.ts&&decisionQuote.ts-decisionQuote.bookTs<=3_000&&decisionTs-decisionQuote.ts<=3_000&&decisionQuote.ask>0;
-      const bucket=`${regimeBucket(f)}:${horizonSeconds}`;
-      if(freshQuote) this.store.addPendingOutcome({id:randomUUID(),decisionTs,dueTs:decisionTs+horizonSeconds*1_000,symbol:f.symbol,bucket,entryAsk:decisionQuote.ask,horizonSeconds});
-      const values=this.store.labelValues(bucket,f.symbol);
-      const edge=edgeStats(values);
-      const symbolOccupied=!!this.paper.position(f.symbol)||this.paper.openOrders.some(order=>order.side==='BUY'&&order.symbol===f.symbol);
-      const common={features:f,assessment:a,rules:this.rules.get(f.symbol),strategy:this.strategy,caps:this.caps,availableUsdt:this.paper.state.usdt,openPositions:symbolOccupied?this.caps.maxPositions:this.paper.occupiedSlots,dailyRealisedLossUsdt:this.paper.state.dailyRealisedLossUsdt,apiSpendUsd:this.apiSpendToday(),edge,now:decisionTs,live:false,paused:this.paused||this.stopped};
-      const standardVerdict=judgeEntry(common);
-      const verdict=judgeEntry({...common,exploratory:true});
-      this.decisions++;
-      this.latencyTotal+=a.latencyMs;
-      for(const gate of verdict.gateFailures??[]) this.jevGateFailures[gate]=(this.jevGateFailures[gate]??0)+1;
-      if(verdict.allowed) {
-        const tick=this.latest.get(f.symbol);
-        if(tick?.bookTs&&Date.now()-tick.bookTs<=3_000) {
-          const order=this.paper.submitBuy(tick,verdict.orderUsdt,'exploratory_paper',this.slippageBps(f.symbol));
-          if(order) {this.approved++;this.store.event('exploratory_paper_order',{symbol:f.symbol,limitPrice:order.limitPrice,quantity:order.quantity,notionalUsdt:verdict.orderUsdt,standardVerdict:standardVerdict.reason});}
-        }
-      } else this.skippedReasons[verdict.reason]=(this.skippedReasons[verdict.reason]??0)+1;
-      const finalVerdict=verdict.allowed?'exploratory_approved':verdict.reason;
-      this.store.decision(decisionTs,f.symbol,finalVerdict,{assessment:a,features:f,edge,requiredBps:verdict.requiredBps,standardVerdict:standardVerdict.reason,exploratoryGateFailures:verdict.gateFailures??[],outcomeQueued:!!freshQuote});
-    } catch(error) {
-      this.skippedReasons.jev_error=(this.skippedReasons.jev_error??0)+1;
-      this.store.event('jev_error',{message:error instanceof Error?error.message:String(error)});
+  private startAssessment(f:MarketFeatures,now:number,holding:boolean) {
+    if(this.paused||this.stopped||this.apiSpendToday()+this.requests.size*0.002>=this.caps.dailyApiSpendUsd)return;
+    this.lastAssessed.set(f.symbol,now);this.assessing++;this.busySymbols.add(f.symbol);
+    void this.assess(f,holding).finally(()=>{this.assessing--;this.busySymbols.delete(f.symbol);});
+  }
+  private checkDeadlines(now:number) {
+    for(const p of [...this.paper.state.positions]) {
+      const plan=this.plans[p.symbol];
+      const deadline=plan?Math.min(plan.deadlineTs,plan.plannedExitTs):p.entryTs+Math.min(this.caps.maxHoldSeconds,120)*1000;
+      if(now<deadline)continue;
+      const tick=this.latest.get(p.symbol);
+      if(tick?.bookTs&&now-tick.bookTs>=0&&now-tick.bookTs<=3_000)this.onTick({...tick,ts:now});
     }
+  }
+  private async assess(f:MarketFeatures,holding=false) {
+    const request=new AbortController();this.requests.add(request);
+    try {
+      const setup=detectSetup(f)??this.plans[f.symbol]?.setup??'early_acceleration';
+      const p=this.paper.position(f.symbol),plan=this.plans[f.symbol];
+      const context:JevContext={purpose:holding?'hold':'entry',setup,roundTripCostBps:tradingCostsBps(f),position:p?{ageSeconds:(Date.now()-p.entryTs)/1000,netPnlBps:(p.quantity*f.bid*(1-TAKER_FEE_BPS/10_000)/p.costUsdt-1)*10_000,drawdownBps:(1-f.bid/p.peakBid)*10_000,remainingSeconds:Math.max(0,((plan?.deadlineTs??p.entryTs+300_000)-Date.now())/1000)}:holding?this.research.positionContext(f.symbol,f,Date.now()):undefined};
+      const a=await this.jev!.assess(f,120,context,request.signal);
+      this.store.usage(Date.now(),'jev',a.inputTokens,a.outputTokens,a.costUsd);
+      if(request.signal.aborted||this.paused||this.stopped) return;
+      const now=Date.now();this.assessments.set(f.symbol,a);this.receivedAt.set(f.symbol,now);
+      this.decisions++;this.latencyTotal+=a.latencyMs;
+      if(holding){this.store.decision(now,f.symbol,'hold_reassessment',{assessment:a,features:f,purpose:'hold'});return;}
+      const current=this.features.get(f.symbol)??f,tick=this.latest.get(f.symbol);
+      if(!tick?.bookTs||now-tick.bookTs<0||now-tick.bookTs>3_000||now-current.ts>3_000||now-f.ts>5_000||Math.abs(tick.ask/f.ask-1)>0.001||detectSetup(current)!==setup) {
+        this.skippedReasons.stale_signal=(this.skippedReasons.stale_signal??0)+1;return;
+      }
+      const forecast=selectForecast(a,current);
+      const bucket=calibrationBucket(setup,a,current,forecast?.horizonSeconds??120);
+      const calibration=this.research.calibration(bucket,now);
+      // All comparable candidates become shadow observations, including rejected entries.
+      const orderUsdt=Math.min(this.caps.maxOrderUsdt,this.caps.floatUsdt*this.strategy.positionFraction,this.paper.state.usdt);
+      this.research.open(current,a,setup,tick,now,orderUsdt);
+      let verdict=signalVerdict(a,current,calibration,this.strategy.costBufferBps);
+      const occupied=!!this.paper.position(f.symbol)||this.paper.openOrders.some(o=>o.symbol===f.symbol);
+      const rules=this.rules.get(f.symbol);
+      if(occupied||this.paper.occupiedSlots>=this.caps.maxPositions)verdict='position_limit';
+      else if(this.paper.state.dailyRealisedLossUsdt>=this.caps.dailyLossStopUsdt)verdict='daily_loss_stop';
+      else if(this.apiSpendToday()>=this.caps.dailyApiSpendUsd)verdict='api_spend_stop';
+      else if(!rules||orderUsdt<rules.minNotional*1.02)verdict='below_exchange_minimum';
+      else if(orderUsdt<=0)verdict='insufficient_usdt';
+      else if(current.spreadBps>15||current.estimatedSlippageBps>10)verdict='liquidity';
+      if(verdict==='approved') {
+        const trade=this.paper.buy(tick,orderUsdt,setup,this.slippageBps(f.symbol),rules);
+        if(trade){this.approved++;const position=this.paper.position(f.symbol)!;this.plans[f.symbol]=makePlan(current,a,setup,trade.price,position.entryTs,this.caps.maxHoldSeconds);this.store.set('positionPlansV2',this.plans);this.store.event('paper_entry',{symbol:f.symbol,setup,expectedGrossBps:forecast?.expectedGrossBps,calibration});}
+        else verdict='execution_rejected';
+      }
+      if(verdict!=='approved')this.skippedReasons[verdict]=(this.skippedReasons[verdict]??0)+1;
+      this.store.decision(now,f.symbol,verdict,{assessment:a,features:current,calibration,requiredBps:tradingCostsBps(current)+this.strategy.costBufferBps,setup,bucket,experimentVersion:2,purpose:'entry'});
+    } catch(error) {
+      if(!request.signal.aborted){this.skippedReasons.jev_error=(this.skippedReasons.jev_error??0)+1;this.retryAt=Date.now()+Math.max(3_000,Number((error as {retryAfterMs?:number}).retryAfterMs)||0);this.store.event('jev_error',{message:error instanceof Error?error.message:String(error)});}
+    } finally {this.requests.delete(request);}
   }
   private processOutcomes(tick:MarketTick) {
     for(const outcome of this.store.pendingOutcomes(tick.symbol)) {
@@ -173,54 +218,37 @@ export class BotEngine {
     }
   }
   async reviewIfDue(now=Date.now()) {
-    if(this.reviewing||!this.reviewer||this.stopped||now-this.lastReviewTs<300_000||this.apiSpendToday()>=this.caps.dailyApiSpendUsd) return;
+    if(this.reviewing||!this.reviewer||this.stopped||this.paused||now-this.lastReviewTs<300_000||this.apiSpendToday()>=this.caps.dailyApiSpendUsd) return;
     if(this.rules.size===0) return;
+    const request=new AbortController();this.requests.add(request);
     this.reviewing=true; this.lastReviewTs=now; this.store.set('lastReviewTs',now);
     try {
-      const before=this.paper.state.realisedPnlUsdt;
       const evidence=this.store.reviewEvidence(now-15*60_000,now);
       const candidates=[...this.rules.values()].filter(r=>r.status==='TRADING'&&r.quoteAsset==='USDT')
         .sort((a,b)=>(this.latest.get(b.symbol)?.quoteVolume24h??0)-(this.latest.get(a.symbol)?.quoteVolume24h??0))
         .slice(0,100).map(r=>r.symbol);
-      const proposal=await this.reviewer.review({strategy:this.strategy,caps:this.caps,metrics:{portfolio:this.paper.portfolio(this.latest),evidence,candidateCount:this.rules.size,monitoredMarketCount:this.monitoredMarketCount,exploratoryPaper:true,exploratoryGateFailures:this.jevGateFailures},candidates});
+      const proposal=await this.reviewer.review({strategy:this.strategy,caps:this.caps,metrics:{portfolio:this.paper.portfolio(this.latest),evidence,candidateCount:this.rules.size,monitoredMarketCount:this.monitoredMarketCount,experimentVersion:2,research:this.research.summary(),automaticChanges:false},candidates},request.signal);
       this.store.usage(Date.now(),'openai',proposal.inputTokens,proposal.outputTokens,proposal.costUsd);
+      if(request.signal.aborted||this.paused||this.stopped)return;
       this.latestReview=proposal.summary.slice(0,240);this.store.set('latestReview',this.latestReview);
-      let applied=false;
-      const measuredProblem=(evidence.trading.closedTrades>=10&&evidence.trading.netPnlUsdt<0)
-        ||(evidence.decisions.jev.outcomes.count>=30&&evidence.decisions.jev.outcomes.meanNetBps<0);
-      if(proposal.action==='patch'&&proposal.patch&&proposal.reason.length>=20&&/\d/.test(proposal.reason)&&measuredProblem) {
-        const next=validateReviewPatch(this.strategy,proposal.patch,candidates);
-        if(next) {
-          this.previousStrategy=this.strategy;this.patchTradeCount=this.store.trades(1_000).filter(t=>t.side==='SELL').length;this.patchPnl=before;
-          this.strategy=next;this.store.set('strategy',next);applied=true;
-        }
-      }
+      const applied=false;
       this.store.review(now,proposal.action,{...proposal,applied,strategyVersion:this.strategy.version});
       this.store.event('review',{action:proposal.action,applied,summary:this.latestReview});
-    } catch(error) {this.store.event('review_error',{message:error instanceof Error?error.message:String(error)});}
-    finally {this.reviewing=false;}
-  }
-  checkRollback() {
-    if(!this.previousStrategy) return;
-    const completed=this.store.trades(1_000).filter(t=>t.side==='SELL').length-this.patchTradeCount;
-    if(completed>=10) {
-      if(this.paper.state.realisedPnlUsdt-this.patchPnl<-0.02) {
-        this.strategy={...this.previousStrategy,version:this.strategy.version+1};
-        this.store.set('strategy',this.strategy);this.store.event('strategy_rollback',{reason:'negative_paper_result'});
-      }
-      this.previousStrategy=null;
-    }
+    } catch(error) {if(!request.signal.aborted)this.store.event('review_error',{message:error instanceof Error?error.message:String(error)});}
+    finally {this.reviewing=false;this.requests.delete(request);}
   }
   apiSpendToday() { const since=new Date(`${utcDay(Date.now())}T00:00:00.000Z`).getTime(); return Object.values(this.store.usageSince(since)).reduce((sum,u)=>sum+u.costUsd,0); }
   recordPortfolio(now=Date.now()) { this.store.portfolioPoint(now,this.paper.portfolio(this.latest).portfolioUsdt,this.portfolioRunId); }
+  private abortProviders() {for(const request of this.requests)request.abort();}
   control(action:string,caps?:Partial<RiskCaps>,startingUsdt?:number) {
     if(action==='restart'&&this.stopped) {
       if(this.paper.state.positions.length) throw new Error('Wait for remaining paper holdings to close before restarting');
-      this.stopped=false;this.paused=true;this.store.set('stopped',false);this.store.set('paused',true);
+      this.stopped=false;this.paused=false;this.liquidationPending=false;this.store.set('stopped',false);this.store.set('paused',false);this.store.set('liquidationPending',false);
     }
-    else if(action==='pause') {for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);this.paused=true;this.store.set('paused',true);}
+    else if(action==='pause') {this.abortProviders();for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);this.paused=true;this.store.set('paused',true);}
     else if(action==='resume'&&!this.stopped&&!this.liquidationPending) {this.paused=false;this.store.set('paused',false);}
     else if(action==='liquidate') {
+      this.abortProviders();
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
       this.paused=true;this.store.set('paused',true);
       for(const position of [...this.paper.state.positions]) {
@@ -233,6 +261,7 @@ export class BotEngine {
       this.liquidationPending=this.paper.state.positions.length>0;this.store.set('liquidationPending',this.liquidationPending);
     }
     else if(action==='stop') {
+      this.abortProviders();
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
       for(const position of [...this.paper.state.positions]) {
         const tick=this.latest.get(position.symbol);
@@ -254,7 +283,7 @@ export class BotEngine {
       const allowed=['floatUsdt','maxOrderUsdt','dailyLossStopUsdt','dailyApiSpendUsd','maxPositions'];
       if(Object.keys(caps).some(k=>!allowed.includes(k))) throw new Error('Unsupported cap');
       for(const value of Object.values(caps)) if(typeof value!=='number'||!Number.isFinite(value)||value<=0) throw new Error('Caps must be positive finite numbers');
-      if(caps.maxPositions!==undefined&&(!Number.isInteger(caps.maxPositions)||caps.maxPositions>5)) throw new Error('Maximum open positions must be an integer from 1 to 5');
+      if(caps.maxPositions!==undefined&&(!Number.isInteger(caps.maxPositions)||caps.maxPositions>MAX_POSITIONS)) throw new Error('Maximum open positions must be an integer from 1 to 50');
       for(const order of this.paper.openOrders)this.paper.cancelOrder(order.id);
       this.caps={...this.caps,...caps};this.paper.setCaps(this.caps);this.store.set('caps',this.caps);
     } else throw new Error('Unknown or unavailable action');
@@ -265,7 +294,7 @@ export class BotEngine {
     const usage=this.store.usageSince(since);const jev=usage.jev??emptyUsage();const openai=usage.openai??emptyUsage();
     const balances=this.paper.portfolio(this.latest);
     const candidates=[...this.rules.values()].filter(r=>r.status==='TRADING'&&r.quoteAsset==='USDT').length;
-    return {mode:'paper' as const,paused:this.paused,stopped:this.stopped,liquidationPending:this.liquidationPending,health:this.health,balances,usage:{jev,openai,totalCostUsd:jev.costUsd+openai.costUsd},caps:this.caps,strategy:this.strategy,latestReview:this.latestReview,openOrders:this.paper.openOrders.map(o=>({id:o.id,symbol:o.symbol,side:o.side,price:o.limitPrice,quantity:o.remainingQuantity,ts:o.createdTs,status:o.status,filledQuantity:o.filledQuantity})),recentTrades:this.store.trades(20),recentEvents:this.store.recentEvents(20),skippedReasons:this.skippedReasons,jevGateFailures:this.jevGateFailures,metrics:{decisions:this.decisions,approved:this.approved,avgDecisionLatencyMs:this.decisions?this.latencyTotal/this.decisions:0},candidateCount:candidates,monitoredMarketCount:this.monitoredMarketCount,portfolioRunId:this.portfolioRunId,updatedAt:Date.now()};
+    return {experiment:{version:2,automaticChanges:false,reassessmentSeconds:3,maxHoldSeconds:Math.min(300,this.caps.maxHoldSeconds),shadowPositions:this.research.activeCount,comparisons:this.research.summary()},positionPlans:this.plans,providerRequestsInFlight:this.requests.size,mode:'paper' as const,paused:this.paused,stopped:this.stopped,liquidationPending:this.liquidationPending,health:this.health,balances,usage:{jev,openai,totalCostUsd:jev.costUsd+openai.costUsd},caps:this.caps,strategy:this.strategy,latestReview:this.latestReview,openOrders:this.paper.openOrders.map(o=>({id:o.id,symbol:o.symbol,side:o.side,price:o.limitPrice,quantity:o.remainingQuantity,ts:o.createdTs,status:o.status,filledQuantity:o.filledQuantity})),recentTrades:this.store.trades(20),recentEvents:this.store.recentEvents(20),skippedReasons:this.skippedReasons,jevGateFailures:this.jevGateFailures,metrics:{decisions:this.decisions,approved:this.approved,avgDecisionLatencyMs:this.decisions?this.latencyTotal/this.decisions:0},candidateCount:candidates,monitoredMarketCount:this.monitoredMarketCount,portfolioRunId:this.portfolioRunId,updatedAt:Date.now()};
   }
   private slippageBps(symbol:string) { return Math.max(0,Math.min(10,this.features.get(symbol)?.estimatedSlippageBps??10)); }
 }

@@ -10,8 +10,8 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>JEV Trading Bot</string>
   <key>CFBundleDisplayName</key><string>JEV Trading Bot</string>
   <key>CFBundleIdentifier</key><string>me.askhenry.jev-trading-bot.dashboard</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>JEV Trading Bot</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>

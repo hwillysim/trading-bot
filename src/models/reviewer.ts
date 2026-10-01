@@ -91,7 +91,7 @@ export class OpenAIReviewer {
   private readonly options: { apiKey?: string; model?: string; endpoint?: string; timeoutMs?: number; fetchImpl?: typeof fetch };
   constructor(options: { apiKey?: string; model?: string; endpoint?: string; timeoutMs?: number; fetchImpl?: typeof fetch } = {}) { this.options = options; }
 
-  async review(input: ReviewInput): Promise<ReviewProposal> {
+  async review(input: ReviewInput, externalSignal?:AbortSignal): Promise<ReviewProposal> {
     const apiKey = this.options.apiKey ?? process.env.OPENAI_API_KEY;
     if (!apiKey) throw new ModelError("OPENAI_API_KEY is required");
     if (!Array.isArray(input.candidates) || input.candidates.length > 100 || input.candidates.some(item => typeof item !== "string" || item.length > 24)) throw new ModelError("Invalid reviewer candidates");
@@ -106,10 +106,10 @@ export class OpenAIReviewer {
         method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body: JSON.stringify({
           model, store: false,
-          instructions: "Review the strategy using the supplied recent performance metrics, hypothetical outcomes grouped by symbol and market regime, and symbol candidates. Treat exploratory paper results as experimental and never claim they establish profitability. Return no_change if evidence is weak, sparse, noisy, or inconclusive. Otherwise propose the smallest bounded strategy patch. Do not change the paper exploration gate or supplied risk caps. Select symbols only from candidates. Give a one-sentence summary.",
+          instructions: "Review the strategy using the supplied recent performance metrics, hypothetical outcomes grouped by symbol and market regime, and symbol candidates. Treat exploratory paper results as experimental and never claim they establish profitability. Return no_change if evidence is weak, sparse, noisy, or inconclusive. Otherwise propose the smallest bounded strategy patch. The running experiment is fixed. Suggestions are recorded for human review and never applied automatically. Do not change supplied risk caps. Compare fixed-time, volatility, JEV-managed and passive execution outcomes, distinguishing missing quotes and unfilled orders. Select symbols only from candidates. Give a one-sentence summary.",
           input: JSON.stringify(input),
           text: { format: { type: "json_schema", name: "strategy_review", strict: true, schema } },
-        }), signal: controller.signal,
+        }), signal: externalSignal?AbortSignal.any([controller.signal,externalSignal]):controller.signal,
       });
       if (!response.ok) throw new ModelError(`OpenAI reviewer failed (HTTP ${response.status})`, response.status);
       const body = await readJson(response);

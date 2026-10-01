@@ -10,11 +10,11 @@ export const DEFAULT_CAPS: RiskCaps = Object.freeze({
 });
 
 export const DEFAULT_STRATEGY: StrategyConfig = Object.freeze({
-  version: 1,
-  entryConfidence: 0.85,
-  continuationProbability: 0.8,
-  reversalExitProbability: 0.75,
-  costBufferBps: 15,
+  version: 2,
+  entryConfidence: 0.5,
+  continuationProbability: 0.55,
+  reversalExitProbability: 0.7,
+  costBufferBps: 3,
   targetHoldSeconds: 120,
   positionFraction: 0.02,
   selectedSymbols: [],

@@ -55,8 +55,8 @@ export function validateReviewPatch(current: StrategyConfig, patch: Partial<Stra
   if (!keys.length || keys.some(k => !allowed.has(k))) return null;
   const next = { ...current, ...patch, version: current.version + 1 };
   const bounds: Record<string, [number, number]> = {
-    entryConfidence: [0.7, 0.99], continuationProbability: [0.65, 0.99],
-    reversalExitProbability: [0.55, 0.95], costBufferBps: [10, 100],
+    entryConfidence: [0.5, 0.99], continuationProbability: [0.5, 0.99],
+    reversalExitProbability: [0.55, 0.95], costBufferBps: [0, 100],
     targetHoldSeconds: [1, 900], positionFraction: [0.005, 1],
   };
   for (const [key, [min, max]] of Object.entries(bounds)) {

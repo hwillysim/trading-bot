@@ -1,4 +1,5 @@
-import type { JevAssessment, MarketFeatures } from "../shared/types.ts";
+import type { JevAssessment, MarketFeatures, JevContext } from "../shared/types.ts";
+import { RETURN_BANDS } from '../core/adaptive.ts';
 import { finiteNumber, isRecord, ModelError, parseRetryAfter, readJson, usage } from "./types.ts";
 
 const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
@@ -34,7 +35,7 @@ export class JevClient {
   private readonly options: { apiKey?: string; endpoint?: string; timeoutMs?: number; fetchImpl?: Fetcher };
   constructor(options: { apiKey?: string; endpoint?: string; timeoutMs?: number; fetchImpl?: Fetcher } = {}) { this.options = options; }
 
-  async assess(features: MarketFeatures, horizonSeconds=60): Promise<JevAssessment> {
+  async assess(features: MarketFeatures, horizonSeconds=60, context?:JevContext, externalSignal?:AbortSignal): Promise<JevAssessment> {
     const apiKey = this.options.apiKey ?? process.env.JEV_API_KEY;
     if (!apiKey) throw new ModelError("JEV_API_KEY is required");
     validateFeatures(features);
@@ -44,18 +45,23 @@ export class JevClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const started = Date.now();
-    const questions = {
-      continuation: { type: "noul", instructions: `Will the current short-term price pattern continue over the next ${horizonSeconds} seconds?` },
+    const questions:Record<string,unknown> = {
+      continuation: { type: "noul", instructions: `Is persistent buying pressure likely to drive an upward price move over the next ${horizonSeconds} seconds?` },
       reversal: { type: "noul", instructions: `Is a short-term reversal more likely than continuation over the next ${horizonSeconds} seconds?` },
       wait: { type: "noul", instructions: "Is waiting preferable because the short-term signal is weak or conflicting?" },
       setup: { type: "score", instructions: "Rate the quality of this short-term trading setup.", criteria: ["poor or conflicting", "weak", "moderate", "strong", "very strong"] },
     };
+    if(context) {
+      questions.clearsCosts={type:'noul',instructions:`Will the mid-price rise by more than ${context.roundTripCostBps.toFixed(2)} basis points over the next ${horizonSeconds} seconds?`};
+      questions.exhaustion={type:'noul',instructions:'Does the recent sequence show buying pressure becoming exhausted?'};
+      for(const horizon of [30,60,120]) {questions[`clears${horizon}`]={type:'noul',instructions:`Will the mid-price rise by more than ${context.roundTripCostBps.toFixed(2)} basis points over the next ${horizon} seconds?`};questions[`return${horizon}`]={type:'choice',instructions:`Which mid-price return band is most likely over the next ${horizon} seconds? Judge the supplied recent sequence and market context.`,criteria:Object.fromEntries(Object.entries(RETURN_BANDS).map(([key,value])=>[key,value.description]))};}
+    }
     try {
       const response = await (this.options.fetchImpl ?? fetch)(this.options.endpoint ?? ENDPOINT, {
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: MODEL, state: marketState(features), questions }),
-        signal: controller.signal,
+        body: JSON.stringify({ model: MODEL, state: context?{...marketState(features),historySeconds:features.historySeconds,volatility5sBps:features.volatility5sBps,buyFlow5s:features.buyFlow5s,sellFlow5s:features.sellFlow5s,btcReturn15s:features.btcReturn15s,ethReturn15s:features.ethReturn15s,recentPath:features.recentPath,trade:context}:marketState(features), questions }),
+        signal: externalSignal?AbortSignal.any([controller.signal,externalSignal]):controller.signal,
       });
       if (!response.ok) {
         throw new ModelError(`Jev request failed (HTTP ${response.status})`, response.status,
@@ -77,6 +83,25 @@ export class JevClient {
       if (!probability(continuationProbability) || !probability(reversalProbability) || !probability(waitProbability) || !probability(setupConfidence) || !finiteNumber(setupScore) || setupScore < 0 || setupScore > 4) {
         throw new ModelError("Jev response contained invalid assessment values");
       }
+      let forecasts:JevAssessment['forecasts'];
+      let clearsCostsProbability:number|undefined,exhaustionProbability:number|undefined;
+      if(context) {
+        const clear=body.answers.clearsCosts,exhaustion=body.answers.exhaustion;
+        if(!isRecord(clear)||!isRecord(exhaustion)||!probability(clear.noul)||!probability(exhaustion.noul)) throw new ModelError('Jev omitted valid cost and exhaustion answers');
+        clearsCostsProbability=clear.noul;exhaustionProbability=exhaustion.noul;
+        const forecastAnswers=body.answers;
+        forecasts=[30,60,120].map(horizon=>{
+          const answer=forecastAnswers[`return${horizon}`],clear=forecastAnswers[`clears${horizon}`];
+          if(!isRecord(clear)||!probability(clear.noul))throw new ModelError('Jev omitted horizon cost probability');
+          if(!isRecord(answer)||!isRecord(answer.probabilities)) throw new ModelError('Jev omitted return probabilities');
+          const probabilities=answer.probabilities;
+          if(Object.keys(probabilities).length!==Object.keys(RETURN_BANDS).length||Object.entries(probabilities).some(([key,value])=>!RETURN_BANDS[key]||!probability(value))) throw new ModelError('Jev returned invalid forecast bands');
+          const total=Object.values(probabilities).reduce<number>((sum,value)=>sum+Number(value),0);
+          if(Math.abs(total-1)>0.03) throw new ModelError('Jev forecast probabilities do not sum to one');
+          const normalised=Object.fromEntries(Object.entries(probabilities).map(([key,value])=>[key,Number(value)/total]));
+          return {horizonSeconds:horizon,clearsCostsProbability:clear.noul,probabilities:normalised,expectedGrossBps:Object.entries(normalised).reduce((sum,[key,value])=>sum+RETURN_BANDS[key]!.bps*value,0)};
+        });
+      }
       const tokenUsage = usage(body.usage.input_tokens, body.usage.output_tokens);
       const durationMs = Date.now() - started;
       return {
@@ -84,7 +109,7 @@ export class JevClient {
         continuationProbability, reversalProbability,
         waitProbability, setupScore, setupConfidence, latencyMs: durationMs,
         inputTokens: tokenUsage.inputTokens, outputTokens: tokenUsage.outputTokens,
-        costUsd: tokenUsage.inputTokens * jevPrice() / 1_000_000, raw: body,
+        costUsd: tokenUsage.inputTokens * jevPrice() / 1_000_000, raw: body, forecasts,clearsCostsProbability,exhaustionProbability,
       };
     } catch (error) {
       if (error instanceof ModelError) throw error;

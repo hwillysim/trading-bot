@@ -45,7 +45,7 @@ test('review evidence caps its window at fifteen minutes and nets paired paper t
     assert.equal(evidence.window.since,until-15*60_000);
     assert.equal(evidence.trading.closedTrades,1);
     assert.equal(evidence.trading.wins,1);
-    assert.ok(Math.abs(evidence.trading.netPnlUsdt-1.9)<1e-12);
+    assert.ok(Math.abs(evidence.trading.netPnlUsdt-1.8)<1e-12);
   } finally {store.close();rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -59,6 +59,15 @@ test('review evidence combines partial BUY fills before calculating SELL P&L', (
     store.trade({id:'sell',ts:since+3,symbol:'BTCUSDT',side:'SELL',quantity:1,price:102,notionalUsdt:102,feeUsdt:0.1,reason:'exit',mode:'paper'});
     const evidence=store.reviewEvidence(since,until);
     assert.equal(evidence.trading.closedTrades,1);
-    assert.ok(Math.abs(evidence.trading.netPnlUsdt-1.9)<1e-12);
+    assert.ok(Math.abs(evidence.trading.netPnlUsdt-1.8)<1e-12);
   } finally {store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('sales outside the review window clear old entry costs before a later round trip',()=>{
+ const store=new Store(':memory:');try{
+  const trade=(id:string,ts:number,side:'BUY'|'SELL',notionalUsdt:number)=>store.trade({id,ts,symbol:'BTCUSDT',side,quantity:1,price:notionalUsdt,notionalUsdt,feeUsdt:.1,reason:'test',mode:'paper'});
+  trade('old-buy',1,'BUY',100);trade('old-sell',2,'SELL',101);trade('new-buy',1_000_001,'BUY',100);trade('new-sell',1_000_002,'SELL',102);
+  const evidence=store.reviewEvidence(1_000_000,1_000_003);
+  assert.equal(evidence.trading.closedTrades,1);assert.ok(Math.abs(evidence.trading.netPnlUsdt-1.8)<1e-10);
+ }finally{store.close();}
 });

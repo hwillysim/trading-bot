@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { MarketTick, RiskCaps } from '../shared/types.ts';
+import type { MarketTick, RiskCaps, SymbolRules } from '../shared/types.ts';
 import { PAPER_SLIPPAGE_BPS, TAKER_FEE_BPS, utcDay } from './defaults.ts';
 import type { RecordedTrade, Store } from './store.ts';
 
@@ -11,6 +11,8 @@ export class PaperBroker {
   state:PaperState;
   private readonly store:Store;
   private caps:RiskCaps;
+  private consumedBooks=new Map<string,number>();
+  private soldBooks=new Map<string,number>();
   constructor(store:Store, caps:RiskCaps) {
     this.store=store;this.caps=caps;
     const saved=store.get<PaperState & {position?:Position|null}>('paper', {usdt:caps.floatUsdt,positions:[],realisedPnlUsdt:0,feesUsdt:0,day:utcDay(Date.now()),dailyRealisedLossUsdt:0,peakPortfolioUsdt:caps.floatUsdt});
@@ -47,12 +49,14 @@ export class PaperBroker {
       if(tick.ts>=order.expiresTs) { this.state.usdt+=order.reservedUsdt;order.reservedUsdt=0;order.status='CANCELLED';changed=true; continue; }
       if(tick.bookTs!==undefined&&(tick.bookTs>tick.ts||tick.ts-tick.bookTs>3_000)) continue;
       if(!Number.isFinite(tick.ask)||tick.ask<=0||!Number.isFinite(tick.askQty)||tick.askQty<=0||tick.ask>order.limitPrice) continue;
+      const bookId=tick.bookUpdateId??tick.bookTs;
+      if(bookId!==undefined&&this.consumedBooks.get(tick.symbol)===bookId) continue;
       const price=tick.ask*(1+Math.max(0,Math.min(10,extraSlippageBps))/10_000);
       if(price>order.limitPrice) continue;
       const affordable=order.reservedUsdt/(price*(1+TAKER_FEE_BPS/10_000));
       const quantity=Math.min(order.remainingQuantity,tick.askQty,affordable);
       if(quantity<=0) continue;
-      changed=true;
+      changed=true;if(bookId!==undefined)this.consumedBooks.set(tick.symbol,bookId);
       const gross=quantity*price,fee=gross*TAKER_FEE_BPS/10_000,total=gross+fee;
       order.reservedUsdt-=total;order.filledQuantity+=quantity;order.remainingQuantity-=quantity;order.feeUsdt+=fee;this.state.feesUsdt+=fee;
       const p=this.position(tick.symbol);
@@ -67,15 +71,23 @@ export class PaperBroker {
   }
   expireOrders(now=Date.now()):number {let expired=0;for(const order of this.openOrders)if(now>=order.expiresTs&&this.cancelOrder(order.id))expired++;return expired;}
   cancelOrder(orderId:string):boolean { const order=(this.state.orders??[]).find(o=>o.id===orderId&&(o.status==='OPEN'||o.status==='PARTIALLY_FILLED'));if(!order)return false;this.state.usdt+=order.reservedUsdt;order.reservedUsdt=0;order.status='CANCELLED';this.save();return true; }
-  buy(tick:MarketTick,notionalUsdt:number,reason:string,extraSlippageBps=0):RecordedTrade|null {
+  buy(tick:MarketTick,notionalUsdt:number,reason:string,extraSlippageBps=0,rules?:SymbolRules):RecordedTrade|null {
     this.rollDay(tick.ts);
     if(this.occupiedSlots>=this.caps.maxPositions || this.position(tick.symbol) || this.openOrders.some(o=>o.symbol===tick.symbol&&o.side==='BUY') || !Number.isFinite(tick.ask) || tick.ask<=0 || notionalUsdt<=0 || notionalUsdt>this.caps.maxOrderUsdt || notionalUsdt>this.state.usdt || this.state.dailyRealisedLossUsdt>=this.caps.dailyLossStopUsdt) return null;
-    const price=tick.ask*(1+(PAPER_SLIPPAGE_BPS+extraSlippageBps)/10_000);
-    const feeUsdt=notionalUsdt*TAKER_FEE_BPS/10_000;
-    const quantity=(notionalUsdt-feeUsdt)/price;
-    const trade:RecordedTrade={id:randomUUID(),ts:tick.ts,symbol:tick.symbol,side:'BUY',quantity,price,notionalUsdt,feeUsdt,reason,mode:'paper'};
-    this.state.usdt-=notionalUsdt;
-    this.state.positions.push({symbol:tick.symbol,quantity,entryPrice:price,entryTs:tick.ts,costUsdt:notionalUsdt,peakBid:tick.bid});
+    const hasDepth=!!tick.depthTs&&tick.ts-tick.depthTs<=3000&&tick.asks?.length;
+    const slip=PAPER_SLIPPAGE_BPS+(hasDepth?0:Math.max(0,extraSlippageBps));
+    const budget=notionalUsdt/(1+TAKER_FEE_BPS/10_000)/(1+slip/10_000);
+    const levels=hasDepth?tick.asks!:[[tick.ask,tick.askQty] as [number,number]];
+    let quantity=0,remaining=budget;
+    for(const [price,qty] of levels){const value=Math.min(remaining,price*qty);quantity+=value/price;remaining-=value;if(remaining<=0)break;}
+    if(rules&&rules.stepSize>0)quantity=Math.floor((quantity+1e-12)/rules.stepSize)*rules.stepSize;
+    if(quantity<=0||rules&&quantity<rules.minQty)return null;
+    const execution=walkBook(levels,quantity);if(!execution)return null;
+    const price=execution.price*(1+slip/10_000),gross=execution.quantity*price,feeUsdt=gross*TAKER_FEE_BPS/10_000,total=gross+feeUsdt;
+    if(total>notionalUsdt+1e-9||rules&&gross<rules.minNotional)return null;
+    const trade:RecordedTrade={id:randomUUID(),ts:tick.ts,symbol:tick.symbol,side:'BUY',quantity:execution.quantity,price,notionalUsdt:gross,feeUsdt,reason,mode:'paper'};
+    this.state.usdt-=total;
+    this.state.positions.push({symbol:tick.symbol,quantity:trade.quantity,entryPrice:price,entryTs:tick.ts,costUsdt:total,peakBid:tick.bid});
     this.state.feesUsdt+=feeUsdt;
     this.store.trade(trade); this.save(); return trade;
   }
@@ -85,17 +97,26 @@ export class PaperBroker {
     for(const order of this.state.orders??[]) if(order.symbol===tick.symbol&&order.side==='BUY'&&(order.status==='OPEN'||order.status==='PARTIALLY_FILLED')) { this.state.usdt+=order.reservedUsdt;order.reservedUsdt=0;order.status='CANCELLED';cancelled=true; }
     const p=this.position(tick.symbol);
     if(!p || p.symbol!==tick.symbol || !Number.isFinite(tick.bid) || tick.bid<=0) {if(cancelled)this.save();return null;}
-    const price=tick.bid*(1-(PAPER_SLIPPAGE_BPS+extraSlippageBps)/10_000);
-    const gross=p.quantity*price;
+    const bookId=tick.bookUpdateId??tick.bookTs;
+    if(bookId!==undefined&&this.soldBooks.get(tick.symbol)===bookId)return null;
+    const hasDepth=!!tick.depthTs&&tick.ts-tick.depthTs<=3000&&tick.bids?.length;
+    const execution=walkBook(hasDepth?tick.bids!:[[tick.bid,tick.bidQty]],p.quantity);
+    if(!execution)return null;
+    const quantity=execution.quantity;
+    if(bookId!==undefined)this.soldBooks.set(tick.symbol,bookId);
+    const price=execution.price*(1-(PAPER_SLIPPAGE_BPS+(hasDepth?0:Math.max(0,extraSlippageBps)))/10_000);
+    const gross=quantity*price;
     const feeUsdt=gross*TAKER_FEE_BPS/10_000;
     const proceeds=gross-feeUsdt;
-    const pnl=proceeds-p.costUsdt;
-    const trade:RecordedTrade={id:randomUUID(),ts:tick.ts,symbol:tick.symbol,side:'SELL',quantity:p.quantity,price,notionalUsdt:gross,feeUsdt,reason,mode:'paper'};
+    const entryCost=p.costUsdt*quantity/p.quantity;
+    const pnl=proceeds-entryCost;
+    const trade:RecordedTrade={id:randomUUID(),ts:tick.ts,symbol:tick.symbol,side:'SELL',quantity,price,notionalUsdt:gross,feeUsdt,netPnlUsdt:pnl,reason,mode:'paper'};
     this.state.usdt+=proceeds;
     this.state.realisedPnlUsdt+=pnl;
     if(pnl<0) this.state.dailyRealisedLossUsdt-=pnl;
     this.state.feesUsdt+=feeUsdt;
-    this.state.positions=this.state.positions.filter(position=>position.symbol!==tick.symbol);
+    if(quantity>=p.quantity-1e-12)this.state.positions=this.state.positions.filter(position=>position.symbol!==tick.symbol);
+    else {p.quantity-=quantity;p.costUsdt-=entryCost;}
     this.state.peakPortfolioUsdt=Math.max(this.state.peakPortfolioUsdt,this.state.usdt);
     this.store.trade(trade); this.save(); return trade;
   }
@@ -109,4 +130,10 @@ export class PaperBroker {
     this.state.peakPortfolioUsdt=Math.max(this.state.peakPortfolioUsdt,total);
     return {availableUsdt:this.state.usdt,holdings,portfolioUsdt:total,reservedUsdt,realisedPnlUsdt:this.state.realisedPnlUsdt,unrealisedPnlUsdt:holdingValue-costUsdt,feesUsdt:this.state.feesUsdt,drawdownPercent:this.state.peakPortfolioUsdt>0?(this.state.peakPortfolioUsdt-total)/this.state.peakPortfolioUsdt*100:0,openPositions:holdings.length};
   }
+}
+
+function walkBook(levels:[number,number][],quantity:number):{price:number;quantity:number}|null {
+  let filled=0,value=0;
+  for(const [price,available] of levels){if(price<=0||available<=0)continue;const take=Math.min(quantity-filled,available);filled+=take;value+=take*price;if(filled>=quantity-1e-12)break;}
+  return filled>0?{price:value/filled,quantity:filled}:null;
 }
