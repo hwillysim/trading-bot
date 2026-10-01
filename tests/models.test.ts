@@ -66,16 +66,13 @@ function reviewerFetch(value: unknown) {
   };
 }
 
-test("reviewer returns a bounded patch and accounts for usage", async () => {
-  const reviewer = new OpenAIReviewer({ apiKey: "test-secret", fetchImpl: reviewerFetch({ action: "patch", reason: "Evidence supports a small adjustment.", summary: "Raise the confidence threshold", patch: { entryConfidence: 0.999, continuationProbability: null, reversalExitProbability: null, costBufferBps: null, targetHoldSeconds: null, positionFraction: 0.8, selectedSymbols: ["ETHUSDT"] } }) });
-  const result = await reviewer.review({ strategy, caps, metrics: { closedTrades: 100 }, candidates: ["BTCUSDT", "ETHUSDT"] });
-  assert.equal(result.action, "patch");
-  assert.equal(result.patch?.entryConfidence, 0.99);
-  assert.equal(result.patch?.positionFraction, 0.1);
-  assert.deepEqual(result.patch?.selectedSymbols, ["ETHUSDT"]);
-  assert.equal(result.inputTokens, 200);
-  assert.ok(Math.abs(result.costUsd - 0.000035) < 1e-12);
-  assert.match(result.summary, /\.$/);
+test("reviewer returns a small validated patch and uses bounded lightweight requests", async () => {
+ let sent:any;
+ const reviewer=new OpenAIReviewer({apiKey:'test',fetchImpl:async(_url,init)=>{sent=JSON.parse(String(init?.body));return Response.json({model:'gpt-6-luna',output_text:JSON.stringify({action:'patch',reason:'Test stronger flow in shadows.',summary:'Raise the buying pressure requirement',patch:{buyFlowRatio:1.5}}),usage:{input_tokens:200,output_tokens:30}});}});
+ const result=await reviewer.review({strategy,caps,metrics:{},candidates:[]});
+ assert.equal(result.patch?.buyFlowRatio,1.5);assert.equal(result.inputTokens,200);
+ assert.ok(Math.abs(result.costUsd-.000035)<1e-12);assert.match(result.summary,/\.$/);
+ assert.deepEqual(sent.reasoning,{effort:'none'});assert.equal(sent.max_output_tokens,600);assert.equal(sent.model,'gpt-6-luna');assert.equal(sent.store,false);
 });
 
 test("reviewer accepts no_change when evidence is weak", async () => {
@@ -86,9 +83,9 @@ test("reviewer accepts no_change when evidence is weak", async () => {
   assert.equal(result.patch, undefined);
 });
 
-test("reviewer rejects symbols outside the supplied candidate list", async () => {
+test("reviewer rejects fields outside its strategy controls", async () => {
   const reviewer = new OpenAIReviewer({ apiKey: "x", fetchImpl: reviewerFetch({ action: "patch", reason: "Test.", summary: "Change symbols.", patch: { entryConfidence: null, continuationProbability: null, reversalExitProbability: null, costBufferBps: null, targetHoldSeconds: null, positionFraction: null, selectedSymbols: ["UNKNOWN"] } }) });
-  await assert.rejects(reviewer.review({ strategy, caps, metrics: {}, candidates: ["BTCUSDT"] }), /outside the candidate list/i);
+  await assert.rejects(reviewer.review({ strategy, caps, metrics: {}, candidates: ["BTCUSDT"] }), /unsupported config field/i);
 });
 
 test('JEV evaluates cost-clearing returns at matching horizons and validates all return bands',async()=>{

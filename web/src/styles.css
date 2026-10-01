@@ -48,3 +48,5 @@ th{font-size:10px}td{font-size:12px}td b{font-size:12px}td small{font-size:10px}
 .risk .inline-cap,.risk .inline-cap~small{grid-column:1/-1}
 @media(max-width:760px){.portfolio-chart{max-width:none;margin-bottom:12px}.chart-wrap{height:240px;padding:0}.chart-y-label,.chart-x-label{font-size:10px}.chart-heading{flex-direction:column;align-items:stretch}.chart-tools{width:100%;justify-content:space-between}.gate-diagnostics{grid-template-columns:1fr 1fr}.inline-cap input{width:100px}}
 .pnl-positive{color:#16815c}.pnl-negative{color:#ba4540}.trade-note{font-size:10px;color:#718078;margin:0 0 12px}
+
+.adviser-note{font-size:10px;line-height:1.6;color:#718078;margin:8px 0}.adviser-toggle{border:1px solid #dce6df;border-radius:6px;background:#f6faf7;color:#385c47;padding:8px 10px;font-size:10px;cursor:pointer;margin:6px 0 10px}.adviser-toggle:disabled{opacity:.5}

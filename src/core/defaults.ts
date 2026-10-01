@@ -10,7 +10,7 @@ export const DEFAULT_CAPS: RiskCaps = Object.freeze({
 });
 
 export const DEFAULT_STRATEGY: StrategyConfig = Object.freeze({
-  version: 2,
+  version: 3,
   entryConfidence: 0.5,
   continuationProbability: 0.55,
   reversalExitProbability: 0.7,
@@ -18,6 +18,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = Object.freeze({
   targetHoldSeconds: 120,
   positionFraction: 0.02,
   selectedSymbols: [],
+  minRelativeVolume: 1.2,
+  buyFlowRatio: 1.3,
+  maxSpreadBps: 10,
+  volatilityMultiple: 2.5,
 });
 
 export const TAKER_FEE_BPS = 10;

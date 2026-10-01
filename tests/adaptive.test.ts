@@ -44,7 +44,7 @@ test('pause aborts JEV and reviewer requests, ignores late answers and prevents 
  let finishJev!:(a:JevAssessment)=>void,finishReview!:(a:any)=>void;
  const engine=new BotEngine(store,{assess:async(_f,_h,_c,signal)=>{jevCalls++;jevSignal=signal;return new Promise(resolve=>finishJev=resolve);}}, {review:async(_input,signal)=>{reviewCalls++;reviewSignal=signal;return new Promise(resolve=>finishReview=resolve);}});
  try {
-  engine.setRules([rules]);const f=feature();engine.onTick(f);engine.onFeatures(f);engine.scan();const reviewing=engine.reviewIfDue();
+  engine.research.outcomeCount=()=>20;engine.setRules([rules]);const f=feature();engine.onTick(f);engine.onFeatures(f);engine.scan();const reviewing=engine.reviewIfDue();
   assert.equal(jevCalls,1);assert.equal(reviewCalls,1);
   engine.control('pause');assert.equal(jevSignal?.aborted,true);assert.equal(reviewSignal?.aborted,true);
   engine.scan(Date.now()+4_000);await engine.reviewIfDue(Date.now()+400_000);assert.equal(jevCalls,1);assert.equal(reviewCalls,1);
@@ -122,7 +122,7 @@ test('an entry executes only after earlier calibration blocks support its net re
   const ts=Date.now(),f=feature(ts),a=assessment(ts),engine=new BotEngine(store,{assess:async()=>a},null);
   engine.control('set-caps',{floatUsdt:1000,maxOrderUsdt:20});engine.setRules([rules]);engine.onTick(f);engine.onFeatures(f);
   const bucket=calibrationBucket('early_acceleration',a,f,120);
-  for(let i=0;i<40;i++)store.db.prepare('INSERT INTO research_outcomes VALUES(?,?,?,?,?,?,?,?)').run(`seed-${i}`,ts-(1+Math.floor(i/5))*300_000,f.symbol,bucket,'jev_volatility',10,'horizon',`seed-${i}`);
+  for(let i=0;i<40;i++)store.db.prepare('INSERT INTO research_outcomes(id,ts,symbol,bucket,variant,net_bps,reason,episode_id,data) VALUES(?,?,?,?,?,?,?,?,?)').run(`seed-${i}`,ts-(1+Math.floor(i/5))*300_000,f.symbol,bucket,'jev_volatility',10,'horizon',`seed-${i}`,'{"eligible":true}');
   engine.scan(ts);await flush();assert.equal(engine.paper.state.positions.length,1);assert.equal(engine.approved,1);
   assert.ok(engine.state().positionPlans[f.symbol]);assert.equal(store.trades(1)[0]!.reason,'early_acceleration');
  }finally{store.close();}

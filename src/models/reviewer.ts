@@ -1,73 +1,29 @@
+import { STRATEGY_BOUNDS, validateStrategyPatch } from '../core/controller.ts';
+import { DEFAULT_STRATEGY } from '../core/defaults.ts';
 import type { ReviewProposal, RiskCaps, StrategyConfig } from "../shared/types.ts";
-import { boundedText, finiteNumber, isRecord, ModelError, readJson, usage } from "./types.ts";
+import { boundedText, isRecord, ModelError, readJson, usage } from "./types.ts";
 
 const ENDPOINT = "https://api.openai.com/v1/responses";
 const DEFAULT_MODEL = "gpt-6-luna";
 const INPUT_USD_PER_MILLION = 0.1;
 const OUTPUT_USD_PER_MILLION = 0.5;
 function priceFromEnv(name:string,fallback:number):number { const value=process.env[name];if(!value)return fallback;const price=Number(value);if(!Number.isFinite(price)||price<0)throw new ModelError(`Invalid ${name}`);return price; }
-const ALLOWED_PATCH_KEYS = new Set([
-  "entryConfidence", "continuationProbability", "reversalExitProbability", "costBufferBps",
-  "targetHoldSeconds", "positionFraction", "selectedSymbols",
-]);
-
 type ReviewInput = { strategy: StrategyConfig; caps: RiskCaps; metrics: unknown; candidates: string[] };
 type ReviewBody = { action: "no_change" | "patch"; reason: string; summary: string; patch: Record<string, unknown> };
-
 const schema = {
-  type: "object", additionalProperties: false,
-  properties: {
-    action: { type: "string", enum: ["no_change", "patch"] },
-    reason: { type: "string" },
-    summary: { type: "string" },
-    patch: {
-      type: "object", additionalProperties: false,
-      properties: {
-        entryConfidence: { type: ["number", "null"] }, continuationProbability: { type: ["number", "null"] },
-        reversalExitProbability: { type: ["number", "null"] }, costBufferBps: { type: ["number", "null"] },
-        targetHoldSeconds: { type: ["integer", "null"] }, positionFraction: { type: ["number", "null"] },
-        selectedSymbols: { type: ["array", "null"], items: { type: "string" } },
-      },
-      required: ["entryConfidence", "continuationProbability", "reversalExitProbability", "costBufferBps", "targetHoldSeconds", "positionFraction", "selectedSymbols"],
-    },
-  }, required: ["action", "reason", "summary", "patch"],
-} as const;
-
-function validateAndBound(result: ReviewBody, input: ReviewInput): ReviewProposal {
-  if (!isRecord(result) || (result.action !== "no_change" && result.action !== "patch") || !boundedText(result.reason, 1_000) || !boundedText(result.summary, 240) || !isRecord(result.patch)) {
-    throw new ModelError("Reviewer returned an invalid proposal");
-  }
-  if (result.action === "no_change") return { action: "no_change", reason: result.reason, summary: oneSentence(result.summary), inputTokens: 0, outputTokens: 0, costUsd: 0, model: "" };
-
-  const patch: NonNullable<ReviewProposal["patch"]> = {};
-  for (const key of Object.keys(result.patch)) {
-    if (!ALLOWED_PATCH_KEYS.has(key)) throw new ModelError("Reviewer proposed an unsupported config field");
-  }
-  const numericRanges: Record<string, [number, number]> = {
-    entryConfidence: [0.5, 0.99], continuationProbability: [0.5, 0.99],
-    reversalExitProbability: [0.5, 0.99], costBufferBps: [0, 500],
-    targetHoldSeconds: [1, Math.min(3_600, input.caps.maxHoldSeconds)],
-    positionFraction: [0, Math.min(1, input.caps.maxOrderUsdt / Math.max(input.caps.floatUsdt, 1))],
-  };
-  for (const [key, value] of Object.entries(result.patch)) {
-    if (value === null) continue;
-    if (key === "selectedSymbols") {
-      if (!Array.isArray(value) || value.length > 20 || value.some(symbol => typeof symbol !== "string" || !input.candidates.includes(symbol))) throw new ModelError("Reviewer selected symbols outside the candidate list");
-      patch.selectedSymbols = [...new Set(value as string[])];
-      continue;
-    }
-    const bounds = numericRanges[key];
-    if (!bounds || !finiteNumber(value) || (key === "targetHoldSeconds" && !Number.isInteger(value))) throw new ModelError("Reviewer proposed an invalid config value");
-    const bounded = Math.max(bounds[0], Math.min(bounds[1], value));
-    if (key === "entryConfidence") patch.entryConfidence = bounded;
-    else if (key === "continuationProbability") patch.continuationProbability = bounded;
-    else if (key === "reversalExitProbability") patch.reversalExitProbability = bounded;
-    else if (key === "costBufferBps") patch.costBufferBps = bounded;
-    else if (key === "targetHoldSeconds") patch.targetHoldSeconds = bounded;
-    else if (key === "positionFraction") patch.positionFraction = bounded;
-  }
-  if (!Object.keys(patch).length) throw new ModelError("Reviewer returned an empty patch");
-  return { action: "patch", reason: result.reason, summary: oneSentence(result.summary), patch, inputTokens: 0, outputTokens: 0, costUsd: 0, model: "" };
+ type:'object',additionalProperties:false,properties:{
+  action:{type:'string',enum:['no_change','patch']},reason:{type:'string'},summary:{type:'string'},
+  patch:{type:'object',additionalProperties:false,properties:Object.fromEntries(Object.keys(STRATEGY_BOUNDS).map(key=>[key,{type:[key==='targetHoldSeconds'?'integer':'number','null']}])),required:Object.keys(STRATEGY_BOUNDS)},
+ },required:['action','reason','summary','patch'],
+};
+function validateAndBound(result:ReviewBody,input:ReviewInput):ReviewProposal {
+ if(!isRecord(result)||(result.action!=='no_change'&&result.action!=='patch')||!boundedText(result.reason,400)||!boundedText(result.summary,240)||!isRecord(result.patch))throw new ModelError('Reviewer returned an invalid proposal');
+ const base={action:result.action,reason:result.reason,summary:oneSentence(result.summary),inputTokens:0,outputTokens:0,costUsd:0,model:''};
+ if(result.action==='no_change')return base;
+ if(Object.keys(result.patch).some(key=>!Object.hasOwn(STRATEGY_BOUNDS,key)))throw new ModelError('Reviewer proposed an unsupported config field');
+ const patch=Object.fromEntries(Object.entries(result.patch).filter(([,value])=>value!==null)) as Partial<StrategyConfig>;
+ if(!validateStrategyPatch({...DEFAULT_STRATEGY,...input.strategy},patch))throw new ModelError('Reviewer proposed an invalid or excessive strategy change');
+ return {...base,patch};
 }
 
 function oneSentence(text: string): string {
@@ -105,8 +61,8 @@ export class OpenAIReviewer {
       const response = await (this.options.fetchImpl ?? fetch)(this.options.endpoint ?? ENDPOINT, {
         method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body: JSON.stringify({
-          model, store: false,
-          instructions: "Review the strategy using the supplied recent performance metrics, hypothetical outcomes grouped by symbol and market regime, and symbol candidates. Treat exploratory paper results as experimental and never claim they establish profitability. Return no_change if evidence is weak, sparse, noisy, or inconclusive. Otherwise propose the smallest bounded strategy patch. The running experiment is fixed. Suggestions are recorded for human review and never applied automatically. Do not change supplied risk caps. Compare fixed-time, volatility, JEV-managed and passive execution outcomes, distinguishing missing quotes and unfilled orders. Select symbols only from candidates. Give a one-sentence summary.",
+          model, store: false, reasoning: { effort: "none" }, max_output_tokens: 600,
+          instructions: "Choose the next small shadow strategy trial using only the compact precomputed scorecard and recent trial history. Avoid repeating failed trials. You control at most two fields within supplied bounds and maximum step sizes. All arithmetic, risk controls, evidence gates and promotions are handled by code. Negative results may justify testing stronger volume/flow filters or narrower spreads. Adjust volatilityMultiple only when paired stop comparisons have at least 20 covered observations across five time blocks and a positive lower bound on improvement. Do not lower continuation or cost buffers simply to force trades. Sparse filter cells and forecast scores do not establish profitability. Prefer no_change when a useful experiment is unsupported. Do not change order size, balances, fees, API budget, loss limits or live mode. Trials are shadow only; code promotes only after 30 eligible fee-net outcomes in five blocks with lower net return above three bps. Use null for unchanged fields, a brief reason and a one-sentence summary.",
           input: JSON.stringify(input),
           text: { format: { type: "json_schema", name: "strategy_review", strict: true, schema } },
         }), signal: externalSignal?AbortSignal.any([controller.signal,externalSignal]):controller.signal,

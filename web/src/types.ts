@@ -4,8 +4,9 @@ export type DashboardState = {
   balances: { availableUsdt: number; holdings: Array<{symbol:string;quantity:number;valueUsdt:number;entryPrice:number;ageSeconds:number}>; portfolioUsdt:number; realisedPnlUsdt:number; unrealisedPnlUsdt:number; feesUsdt:number; drawdownPercent:number; openPositions:number };
   usage: { jev: Usage; openai: Usage; totalCostUsd:number };
   caps: { floatUsdt:number; maxOrderUsdt:number; dailyLossStopUsdt:number; dailyApiSpendUsd:number; maxHoldSeconds:number; maxPositions:number };
-  strategy: { version:number; entryConfidence:number; continuationProbability:number; reversalExitProbability:number; costBufferBps:number; targetHoldSeconds:number; positionFraction:number; selectedSymbols:string[] };
+  strategy: { version:number; entryConfidence:number; continuationProbability:number; reversalExitProbability:number; costBufferBps:number; targetHoldSeconds:number; positionFraction:number; selectedSymbols:string[];minRelativeVolume?:number;buyFlowRatio?:number;maxSpreadBps?:number;volatilityMultiple?:number };
   experiment?:{version:number;reassessmentSeconds:number;maxHoldSeconds:number;shadowPositions:number;comparisons:Array<{variant:string;completed:number;covered:number;meanNetBps:number|null;wins:number}>};
+  strategyController?:{enabled:boolean;trial:{candidate:DashboardState['strategy'];startedTs:number;reason:string;profile:string}|null;lastAction:string;lastReason:string;lastChangeTs:number;lastReviewTs:number;lastReviewedOutcomes:number;completedOutcomes:number;reviewIntervalMinutes:number;trialTimeoutMinutes:number;trialEvidence:{total:number;eligible:number;count:number;blocks:number;lowerNetBps:number|null}|null};
   positionPlans?:Record<string,{stopBid:number;dipBps:number;deadlineTs:number;setup:string}>;
   providerRequestsInFlight?:number;
   latestReview:string;
@@ -15,4 +16,4 @@ export type DashboardState = {
   metrics:{decisions:number;approved:number;avgDecisionLatencyMs:number}; candidateCount:number; monitoredMarketCount?:number; portfolioRunId?:number; updatedAt:number;
 };
 type Usage={inputTokens:number;outputTokens:number;costUsd:number;requests:number};
-export type ControlAction='pause'|'resume'|'liquidate'|'stop'|'restart'|'set-caps'|'start-paper';
+export type ControlAction='pause'|'resume'|'liquidate'|'stop'|'restart'|'set-caps'|'start-paper'|'disable-strategy-adjustments'|'enable-strategy-adjustments';

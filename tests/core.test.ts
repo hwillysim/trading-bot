@@ -247,7 +247,7 @@ test('a rejected cost-aware assessment still starts shadow comparisons',async()=
     assert.equal(engine.research.activeCount,1);
     const decision=store.db.prepare('SELECT verdict,data FROM decisions ORDER BY id DESC LIMIT 1').get() as {verdict:string;data:string};
     assert.equal(decision.verdict,'jev_signal_weak');
-    assert.equal(JSON.parse(decision.data).experimentVersion,2);
+    assert.equal(JSON.parse(decision.data).experimentVersion,3);
     assert.equal(store.trades().length,0);
   } finally {store.close();}
 });
@@ -265,7 +265,7 @@ test('pausing cancels a pending paper order and restores reserved cash',()=>{
   } finally {store.close();}
 });
 
-test('reviewer patch is ignored without a measured performance problem',async()=>{
+test('reviewer skips calls until enough new shadow outcomes exist',async()=>{
   const store=new Store(':memory:');
   try {
     const reviewer={review:async()=>({action:'patch' as const,reason:'Recent performance is negative by 20 basis points.',summary:'Reduce exposure until results improve.',patch:{positionFraction:0.019},inputTokens:10,outputTokens:10,costUsd:0.00001,model:'gpt-6-luna'})};
@@ -273,7 +273,7 @@ test('reviewer patch is ignored without a measured performance problem',async()=
     engine.setRules([rules]);
     await engine.reviewIfDue(Date.now());
     assert.equal(engine.strategy.version,DEFAULT_STRATEGY.version);
-    assert.equal(store.reviews(1).length,1);
+    assert.equal(store.reviews(1).length,0);
   } finally {store.close();}
 });
 

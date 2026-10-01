@@ -58,6 +58,10 @@ export interface StrategyConfig {
   targetHoldSeconds: number;
   positionFraction: number;
   selectedSymbols: string[];
+  minRelativeVolume?: number;
+  buyFlowRatio?: number;
+  maxSpreadBps?: number;
+  volatilityMultiple?: number;
 }
 
 export interface RiskCaps {
@@ -100,7 +104,7 @@ export interface ReviewProposal {
   action: 'no_change' | 'patch';
   reason: string;
   summary: string;
-  patch?: Partial<Pick<StrategyConfig, 'entryConfidence' | 'continuationProbability' | 'reversalExitProbability' | 'costBufferBps' | 'targetHoldSeconds' | 'positionFraction' | 'selectedSymbols'>>;
+  patch?: Partial<StrategyConfig>;
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
